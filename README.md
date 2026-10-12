@@ -109,6 +109,13 @@ python scripts/download_p18.py export --output data/p18-all
 
 正常恢复通过文件存在性和字节数快速检查；同长度损坏需要 `verify` 的哈希校验才能发现。连续失败达到默认 10 次时停止本轮，避免在网络阻断时持续请求。缩略图不可用时记录失败，不会偷偷改下大幅原图；`--width 0` 是显式请求原图，但原始 SVG 等 Pillow 无法解码的格式会失败，因此推荐默认缩略图。
 
+如果旧版出现 `Unexpected Commons image host: thumb.wikimedia.org`，这是缩略图域名兼容问题。[Wikimedia 已将缩略图迁到该域名](https://wikitech.wikimedia.org/wiki/Thumbor)，当前脚本支持它和原图域名 `upload.wikimedia.org`。更新脚本后，在原输出目录执行 `download --retry-failed` 即可恢复；不要删除 SQLite 或重新采集清单。比如此前使用 500 像素的小样本：
+
+```bash
+python scripts/download_p18.py download --output data/p18-pilot --width 500 --retry-failed
+python scripts/download_p18.py export --output data/p18-pilot
+```
+
 退出码：0 为当前命令成功；1 为本轮错误；2 表示仍有下载失败，或校验发现损坏；130 为键盘中断。使用 `--limit` 成功退出只表示本次限量任务完成，不表示全量完成。确认 `dump_progress.complete=true`，并检查文件状态中是否还有 pending/failed。
 
 ## 产物

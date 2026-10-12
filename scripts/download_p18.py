@@ -36,6 +36,8 @@ from PIL import Image
 LOG = logging.getLogger("p18")
 WD_API = "https://www.wikidata.org/w/api.php"
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+# Wikimedia moved thumbnails to thumb.wikimedia.org in 2026; originals stay on upload.
+COMMONS_IMAGE_HOSTS = frozenset({"upload.wikimedia.org", "thumb.wikimedia.org"})
 SPARQL = "https://query.wikidata.org/sparql"
 SCHEMA_VERSION = 1
 ID_RE = re.compile(r"[QP][1-9][0-9]*\Z")
@@ -354,7 +356,7 @@ class Network:
 
     def image(self, url, root, file_id, max_bytes):
         parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname != "upload.wikimedia.org":
+        if parsed.scheme != "https" or parsed.hostname not in COMMONS_IMAGE_HOSTS:
             raise ValueError(f"Unexpected Commons image host: {parsed.hostname}")
         directory = root / "images" / file_id[:2]
         directory.mkdir(parents=True, exist_ok=True)

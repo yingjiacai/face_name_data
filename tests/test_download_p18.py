@@ -80,7 +80,7 @@ class Tests(unittest.TestCase):
             for title in request.url.params["titles"].split("|"):
                 pages.append({"title": title, "pageid": 7, "imageinfo": [{
                     "url": "https://upload.wikimedia.org/original.jpg",
-                    "thumburl": "https://upload.wikimedia.org/thumb.png",
+                    "thumburl": "https://thumb.wikimedia.org/thumb.png",
                     "width": 4000, "height": 3000, "size": 1000000, "mime": "image/jpeg",
                     "sha1": "original-sha1", "descriptionurl": "https://commons.wikimedia.org/wiki/" + title,
                     "extmetadata": {"LicenseShortName": {"value": "CC BY-SA"}}}]})
@@ -217,7 +217,7 @@ class Tests(unittest.TestCase):
         network = self.network(handler)
         self.assertEqual(p18.download(self.catalog, network), (1, 0))
         self.assertEqual(p18.download(self.catalog, network), (0, 0))
-        self.assertEqual(calls, ["commons.wikimedia.org", "upload.wikimedia.org"])
+        self.assertEqual(calls, ["commons.wikimedia.org", "thumb.wikimedia.org"])
         p18.export(self.catalog)
         pairs = [json.loads(line) for line in (self.catalog.root / "pairs.jsonl").read_text().splitlines()]
         self.assertEqual(len(pairs), 2)
@@ -252,6 +252,50 @@ class Tests(unittest.TestCase):
         result = p18.download(self.catalog, self.network(self.commons), max_bytes=1)
         self.assertEqual(result, (1, 1))
         self.assertEqual(list(self.catalog.root.rglob("*.part")), [])
+
+    def test_original_upload_host_remains_supported(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.host)
+            return httpx.Response(200, content=png_bytes())
+
+        result = self.network(handler).image(
+            "https://upload.wikimedia.org/original.png", self.catalog.root, "original", 1024**2)
+        self.assertEqual(calls, ["upload.wikimedia.org"])
+        self.assertEqual(result["sha256"], hashlib.sha256(png_bytes()).hexdigest())
+
+    def test_other_hosts_and_non_https_are_rejected_before_request(self):
+        def handler(request):
+            self.fail(f"Rejected URL must not be requested: {request.url}")
+
+        network = self.network(handler)
+        for url in ("http://thumb.wikimedia.org/image.png",
+                    "https://thumb.wikimedia.org.example.com/image.png",
+                    "https://example.com/image.png"):
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "Unexpected Commons image host"):
+                network.image(url, self.catalog.root, "rejected", 1024**2)
+
+    def test_retry_old_thumbnail_host_failures_preserves_completed_files(self):
+        self.add(entity("Q42", "First.jpg"))
+        self.add(entity("Q90", "Second.jpg", human=False))
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.host)
+            return self.commons(request)
+
+        network = self.network(handler)
+        self.assertEqual(p18.download(self.catalog, network, width=500, limit=1), (1, 0))
+        self.catalog.db.execute("""UPDATE files SET status='failed',
+            error='ValueError: Unexpected Commons image host: thumb.wikimedia.org'
+            WHERE status='pending'""")
+        self.catalog.db.commit()
+        calls.clear()
+        self.assertEqual(p18.download(self.catalog, network, width=500, retry_failed=True), (1, 0))
+        self.assertEqual(calls, ["commons.wikimedia.org", "thumb.wikimedia.org"])
+        self.assertEqual(self.catalog.summary()["file_status"], {"downloaded": 2})
+        self.assertEqual(p18.verify(self.catalog)["verified"], 2)
 
     def test_sample_persists_id_selection_and_skips_network_on_resume(self):
         calls = []
