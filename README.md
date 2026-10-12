@@ -2,7 +2,31 @@
 
 下载带有 P18 的 Wikidata 条目及其 Commons 图片，供后续数据建设使用。默认覆盖所有实体类别；人物、地点、作品等都会保留。`--scope humans` 可限定为具有非弃用 `P31=Q5` 声明的条目。
 
-图片默认使用 **960 像素宽的 Commons 缩略图**，不在本地放大或重新压缩。原图较小时可能返回原图尺寸；纵向图片的高度可能大于 960。需要更省空间时首次下载可设 `--width 500`。每个输出目录固定一个分辨率配置。
+全量入口默认使用 **500 像素宽的 Commons 缩略图**。原图较小时可能返回原图尺寸；纵向图片的高度可能大于 500。每个输出目录固定一个分辨率配置。单独调用 Python 的 `download` 子命令时，首次运行的默认宽度仍为 960，可用 `--width 500` 指定。
+
+## 直接下载全量
+
+在已经安装依赖、设置好 `P18_USER_AGENT` 的 Google Cloud Linux 机器上，运行：
+
+```bash
+bash scripts/download_all_p18.sh
+```
+
+该命令会连续完成：下载官方完整 JSON dump → 校验 → 提取全部带 P18 的条目 → 下载全部对应图片 → 导出名字—图像对。**没有 200/1000 条上限，也没有中途的试跑步骤。** 默认输出到 `data/p18-all`，中断后重复相同命令即可恢复。已有的 `data/p18-pilot` 不参与这条全量任务。
+
+默认选用带日期的 `20261005` gzip 快照，解压速度通常比 bz2 快。可用 `P18_DUMP_DATE` 选择官方目录中其他已完成快照，用 `P18_DUMP_COMPRESSION=bz2` 选择体积更小的压缩包，用 `P18_IMAGE_WIDTH` 调整图片宽度。长任务可以直接放进 `tmux`：
+
+```bash
+tmux new -s wikidata-p18 'bash scripts/download_all_p18.sh'
+```
+
+查看进度：
+
+```bash
+python scripts/download_p18.py status --output data/p18-all
+```
+
+`sample` 只创建小清单，删除它的 `--limit` 仍默认取 200 条；`download` 只处理所在目录已经有的清单，删除它的 `--limit` 不会把小清单扩大为全量。全量使用上面的入口。
 
 ## 工程方案与采集语义
 
@@ -15,7 +39,7 @@
 
 Python 3.10+，Linux/macOS。CPU 机器即可。元数据 API 串行请求，图片默认 2 个工作线程、总请求起始频率最多约 2 次/秒；429、5xx、`maxlag` 会退避，遵守 `Retry-After`。增加 CPU 核数不会消除源站的限速。
 
-## 安装与小样本
+## 安装
 
 以下命令在 Google Cloud 机器的仓库目录运行。数据目录应位于容量足够的持久磁盘；本机无需先下载数据再上传。建议用 `tmux` 保持会话。
 
@@ -27,12 +51,12 @@ python -m pip install -r requirements.txt
 # 改成你的真实联系邮箱或公开项目/用户页；无需 API Key。
 export P18_USER_AGENT='WikidataP18Downloader/0.1 (mailto:YOUR_REAL_EMAIL)'
 
-python scripts/download_p18.py sample --output data/p18-pilot --limit 200
-python scripts/download_p18.py download --output data/p18-pilot
-python scripts/download_p18.py export --output data/p18-pilot
+bash scripts/download_all_p18.sh
 ```
 
-也可以指定条目，例如人物、地点和历史人物混合检查：
+## 可选：小样本调试
+
+只有需要调试时才使用 `sample`。例如指定几个条目：
 
 ```bash
 python scripts/download_p18.py sample --output data/p18-qids --qids Q42 Q90 Q517
@@ -44,7 +68,7 @@ python scripts/download_p18.py export --output data/p18-qids
 
 ## 全量：在云端直接下载官方 dump
 
-先从[官方目录](https://dumps.wikimedia.org/wikidatawiki/entities/)选一份**带日期的完整 JSON dump**，不要用持续变化的 `latest` 链接做跨日断点续传。下面是 2026-10-12 核验过的 2026-10-05 快照示例，后续旧快照可能被轮换清理。`.bz2` 压缩包约 103 GB，`.gz` 约 156 GB；gzip 通常解压更快，bz2 更节省暂存空间。除此之外还要为图片、SQLite 和 JSONL 预留空间，图片总量应先以小样本估算。
+以下是逐阶段执行方式；上面的一条命令入口已经自动串联这些步骤。从[官方目录](https://dumps.wikimedia.org/wikidatawiki/entities/)选择**带日期的完整 JSON dump**，避免用持续变化的 `latest` 链接跨日续传。下面是 2026-10-12 核验过的 2026-10-05 快照示例，后续旧快照可能被轮换清理。`.bz2` 压缩包约 103 GB，`.gz` 约 156 GB；gzip 通常解压更快，bz2 更节省暂存空间。图片、SQLite 和导出文件另外占用磁盘空间。
 
 在 `tmux` 中逐条执行；每一步成功后再执行下一步：
 
@@ -75,12 +99,7 @@ cd ..
 python scripts/download_p18.py import-dump \
   --dump downloads/wikidata-20261005-all.json.bz2 --output data/p18-all
 
-# 先下载全量清单中的 200 个唯一图片，确认权限和空间。
-python scripts/download_p18.py download --output data/p18-all --limit 200
-python scripts/download_p18.py export --output data/p18-all
-
-# 去掉 limit 后继续全部下载，已完成文件会跳过。
-python scripts/download_p18.py download --output data/p18-all
+python scripts/download_p18.py download --output data/p18-all --width 500 --retry-failed
 python scripts/download_p18.py export --output data/p18-all
 ```
 
