@@ -34,10 +34,10 @@ python scripts/download_p18.py status --output data/p18-all
 2. 默认收集 Q/P 条目的全部非弃用 P18 声明，包括 normal 和 preferred；忽略 deprecated、novalue、somevalue。保留声明 ID、rank、限定符和引用。此处“有效声明”只表示结构上有值且未弃用，不表示图像正确。
 3. 姓名优先中文、简体中文、英文，缺少时取其余可用 label；完全没有 label 时用 QID 并明确标记。保留所有语言的 labels、aliases、descriptions，及 P31 类型、P373 分类、Wikidata 版本号。
 4. 通过 Commons `imageinfo` 获取缩略图地址、原图地址、原始尺寸、作者和许可等源信息。一个实体多张 P18 全部保留；多个实体共享同一规范化文件名时，只下载一次文件。
-5. SQLite 保存实体、对应关系、下载状态和 dump 进度；文件先写 `.part`，通过实际图像解码和 SHA-256 计算后再原子重命名。重跑可跳过已完成文件，失败任务可单独重试。
+5. SQLite 保存实体、对应关系、下载状态和 dump 进度；图片先在本机 `staging/` 写 `.part`、实际解码并计算 SHA-256，再交给独立线程写入最终图片目录。只有最终写入、同步和关闭成功，SQLite 才标记为 `downloaded`，随后清除暂存。对象存储上传失败或中断时保留本地副本供下次补传。
 6. 下载阶段不做人脸检测或身份验证。所有导出记录的 `reference_verified` 都是 `false`；不得直接把下载完成当成已经确认的 GT。
 
-Python 3.10+，Linux/macOS。CPU 机器即可。元数据 API 串行请求，图片默认 2 个工作线程、总请求起始频率最多约 2 次/秒；429、5xx、`maxlag` 会退避，遵守 `Retry-After`。增加 CPU 核数不会消除源站的限速。
+Python 3.10+，Linux/macOS。CPU 机器即可。元数据 API 串行预取，每批最多 5 个文件；默认 2 条图片连接与 4 个存储写入线程。图片完成后立即补入下一张，不再有固定的 0.5 秒请求间隔，也不再等待整批图片完成。图片连接共享 25 Mbps 字节限速；429、5xx、`maxlag` 仍会退避并遵守 `Retry-After`。[Wikimedia 媒体下载规则](https://wikitech.wikimedia.org/wiki/Robot_policy#Media_API_rules)要求最多 2 条媒体连接及 25 Mbps 总带宽，增加存储写入线程不会增加 Wikimedia 图片连接数。
 
 ## 安装
 
@@ -109,6 +109,46 @@ python scripts/download_p18.py export --output data/p18-all
 
 一个输出目录绑定一个输入快照和范围。换 dump、移动或修改已绑定的 dump、改变 scope、把 sample 和全量混用，都会报错；使用新的输出目录即可。`state.sqlite3` 应位于本机磁盘，不建议放在网络共享文件系统上。
 
+## 对象存储与连续下载
+
+支持继续使用 `data/p18-all/images` 指向对象存储挂载目录的软链接。SQLite、dump 和 `data/p18-all/staging` 留在本机；`staging` 不能另行软链接到对象存储。更新脚本后，等旧下载进程退出，在原输出目录启动即可接着下载，无需重新导入 dump。
+
+对于已经完成图片迁移、验证过已有图片，并将对象存储挂载在 `/mnt/algo_data` 的 Google Cloud Linux 机器：
+
+```bash
+(
+set -e
+mountpoint -q /mnt/algo_data
+
+python scripts/download_p18.py download \
+  --output data/p18-all \
+  --width 500 \
+  --workers 2 \
+  --upload-workers 8 \
+  --staging-mib 1024 \
+  --skip-existing-check \
+  --retry-failed
+)
+```
+
+该命令在仓库目录运行，沿用已设置的 `P18_USER_AGENT`；也可显式传 `--user-agent`。默认处理整个清单，没有数量上限。
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `--workers` | `2` | Wikimedia 图片下载连接数，只能为 1 或 2。 |
+| `--upload-workers` | `4` | 最终图片目录的并发写入数；挂载对象存储时可设为 8。 |
+| `--bandwidth-mbps` | `25` | 两条图片连接共享的总带宽上限，单位为兆比特/秒，上限 25；包含重试数据。 |
+| `--staging-mib` | `1024` | 本地暂存图片的预算，必须至少容纳一张 `--max-image-mib` 规定的最大图片。 |
+| `--skip-existing-check` | 关闭 | 直接相信 SQLite 中的 `downloaded` 状态，跳过对象存储上的逐文件存在性/大小查询。缺失或损坏的旧文件需用 `verify --repair` 发现并重新排队。 |
+| `--log-interval` | `15` | 每隔多少秒输出一条速度、剩余量和耗时统计。 |
+| `--verbose` | 关闭 | 打开逐条 HTTP 请求日志；默认仅输出进度、重试与错误。 |
+
+内存中的任务队列最多容纳 32 个文件；每次下载前按单张图片的最大允许大小预留暂存额度。写入变慢时队列自动等待，避免持续堆积。暂存预算计算包括之前失败而保留的图片，不包含少量 JSON 元数据及挂载工具自身的缓存；目录空闲空间不足仍会报错停止。若已有失败暂存占满预算，使用 `--retry-failed` 优先补传它们，或显式提高预算。
+
+图片下载与校验只操作本地暂存，最终图片通过挂载目录直接写入最终文件名，避免远端 `.part`、校验回读和改名产生的额外操作。临时存储 I/O 错误会重试两次；写满、无权限、只读则停止。只有 SQLite 提交为 `downloaded` 后，文件才视为完成；中断可能在对象目录留下尚未完成的文件，重跑会覆盖它们。因此下游应读取 SQLite 或导出结果的成功记录，而不是直接扫描图片目录。
+
+每条进度包含 `files/s`（最近约一分钟的处理速度，含失败）、`MiB/s stored`（成功写入的字节速度）、本轮剩余任务数、`ETA`、`avg fetch`（下载和本地校验平均耗时）、`store`（最终存储平均耗时）、复用暂存数及暂存预留额度。ETA 估计的是本轮结束时间，失败文件仍需重试；不能把离线测试速度当成云端实测速度。
+
 ## 进度、重试与校验
 
 ```bash
@@ -126,7 +166,7 @@ python scripts/download_p18.py download --output data/p18-all
 python scripts/download_p18.py export --output data/p18-all
 ```
 
-正常恢复通过文件存在性和字节数快速检查；同长度损坏需要 `verify` 的哈希校验才能发现。连续失败达到默认 10 次时停止本轮，避免在网络阻断时持续请求。缩略图不可用时记录失败，不会偷偷改下大幅原图；`--width 0` 是显式请求原图，但原始 SVG 等 Pillow 无法解码的格式会失败，因此推荐默认缩略图。
+默认恢复通过文件存在性和字节数检查；`--skip-existing-check` 可跳过这一步。同长度损坏需要 `verify` 的哈希校验才能发现。上传失败的本地暂存会在重试时校验哈希并补传，内容损坏则重新下载。连续失败达到默认 10 次时停止接收新任务；按一次 Ctrl+C 也会停止新任务，等待已经开始的存储写入退出并保留暂存，之后重复命令恢复。缩略图不可用时记录失败，不会偷偷改下大幅原图；`--width 0` 是显式请求原图，但原始 SVG 等 Pillow 无法解码的格式会失败，因此推荐默认缩略图。
 
 如果旧版出现 `Unexpected Commons image host: thumb.wikimedia.org`，这是缩略图域名兼容问题。[Wikimedia 已将缩略图迁到该域名](https://wikitech.wikimedia.org/wiki/Thumbor)，当前脚本支持它和原图域名 `upload.wikimedia.org`。更新脚本后，在原输出目录执行 `download --retry-failed` 即可恢复；不要删除 SQLite 或重新采集清单。比如此前使用 500 像素的小样本：
 
@@ -142,6 +182,7 @@ python scripts/download_p18.py export --output data/p18-pilot
 ```text
 data/p18-all/
   state.sqlite3           # 断点和完整状态，核心数据，保留好
+  staging/                # 本地待上传图片和校验记录；成功写入、提交后自动清除
   images/ab/<file_id>.jpg # 按文件名哈希分片，实际扩展名来自图像解码
   entities.jsonl          # 一行一个条目：名字、别名、描述、全部 P18 声明等
   pairs.jsonl             # 一行一个 QID—图片对应，包含成功和失败状态
@@ -159,6 +200,6 @@ python -m unittest discover -s tests -v
 python scripts/download_p18.py --help
 ```
 
-离线测试覆盖非人物收集、多 P18/rank、跨实体图片复用、压缩 dump 恢复与截断、Commons 规范化/重定向、限流退避、坏图处理、断点恢复和哈希修复，不会启动全量下载。
+离线测试覆盖非人物收集、多 P18/rank、跨实体图片复用、压缩 dump 恢复与截断、Commons 规范化/重定向、限流退避、坏图与 MPO 处理、断点恢复和哈希修复；也覆盖跨批次连续下载、存储阻塞与下载分离、全局字节限速、暂存预算、上传失败及中断后的无网络补传、暂存损坏重下载、对象目录软链接和快速续传。不会启动全量下载。
 
 实现参考：[官方 dump 格式](https://www.wikidata.org/wiki/Wikidata:Database_download)、[Commons imageinfo](https://www.mediawiki.org/wiki/API:Imageinfo)、[API 请求约定](https://www.mediawiki.org/wiki/API:Etiquette)、[公开查询服务限制](https://www.mediawiki.org/wiki/Wikidata_Query_Service/User_Manual#Query_limits)。

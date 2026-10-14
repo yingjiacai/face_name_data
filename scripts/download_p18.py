@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import argparse
 import bz2
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -18,6 +19,7 @@ import gzip
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -44,7 +46,7 @@ ID_RE = re.compile(r"[QP][1-9][0-9]*\Z")
 RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 RETRY_API = {"maxlag", "ratelimited", "readonly", "internal_api_error_DBQueryError"}
 EXTENSIONS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif",
-              "TIFF": ".tif", "BMP": ".bmp", "AVIF": ".avif"}
+              "TIFF": ".tif", "BMP": ".bmp", "AVIF": ".avif", "MPO": ".mpo"}
 
 
 def now():
@@ -291,23 +293,51 @@ def retry_after(value):
 
 
 class RateLimiter:
-    def __init__(self, api_interval=1.0, image_interval=0.5):
+    def __init__(self, api_interval=1.0, image_interval=0.0, cancel=None):
         self.intervals = {"api": api_interval, "image": image_interval}
         self.next_at = {"api": 0.0, "image": 0.0}
         self.lock = threading.Lock()
+        self.cancel = cancel or threading.Event()
 
     def wait(self, group):
         while True:
+            if self.cancel.is_set():
+                raise CancelledError()
             with self.lock:
                 delay = self.next_at[group] - time.monotonic()
                 if delay <= 0:
                     self.next_at[group] = time.monotonic() + self.intervals[group]
                     return
-            time.sleep(delay)
+            if self.cancel.wait(delay):
+                raise CancelledError()
 
     def pause(self, group, delay):
         with self.lock:
             self.next_at[group] = max(self.next_at[group], time.monotonic() + delay)
+
+
+class BandwidthLimiter:
+    """Share a byte budget across media connections, including retries."""
+    def __init__(self, mbps=25, cancel=None, clock=None, sleep=None):
+        if not math.isfinite(mbps) or not 0 < mbps <= 25:
+            raise ValueError("--bandwidth-mbps must be greater than 0 and at most 25")
+        self.bytes_per_second = mbps * 1_000_000 / 8
+        self.next_at = 0.0
+        self.lock = threading.Lock()
+        self.cancel = cancel or threading.Event()
+        self.clock = clock or time.monotonic
+        self.sleep = sleep or self.cancel.wait
+
+    def consume(self, size):
+        if self.cancel.is_set():
+            raise CancelledError()
+        with self.lock:
+            current = self.clock()
+            self.next_at = max(current, self.next_at) + size / self.bytes_per_second
+            delay = self.next_at - current
+        self.sleep(delay)
+        if self.cancel.is_set():
+            raise CancelledError()
 
 
 class Network:
@@ -317,7 +347,9 @@ class Network:
         self.client = client or httpx.Client(headers={"User-Agent": user_agent},
                                              timeout=httpx.Timeout(90, connect=20),
                                              follow_redirects=True)
-        self.limiter = limiter or RateLimiter()
+        self.cancel = threading.Event()
+        self.limiter = limiter or RateLimiter(cancel=self.cancel)
+        self.bandwidth = BandwidthLimiter(cancel=self.cancel)
         self.retries = retries
 
     def close(self):
@@ -325,6 +357,8 @@ class Network:
 
     def run(self, group, operation):
         for attempt in range(self.retries + 1):
+            if self.cancel.is_set():
+                raise CancelledError()
             self.limiter.wait(group)
             try:
                 return operation()
@@ -343,7 +377,10 @@ class Network:
 
     def json(self, url, params):
         def operation():
+            started = time.monotonic()
             response = self.client.get(url, params=params)
+            if time.monotonic() - started > 1:
+                self.limiter.pause("api", 5)
             self.check_response(response)
             data = response.json()
             if "error" in data:
@@ -372,6 +409,7 @@ class Network:
                         raise ValueError("Image exceeds --max-image-mib")
                     with partial.open("wb") as stream:
                         for block in response.iter_bytes(128 * 1024):
+                            self.bandwidth.consume(len(block))
                             count += len(block)
                             if count > max_bytes:
                                 raise ValueError("Image exceeds --max-image-mib")
@@ -490,88 +528,343 @@ def resolve_files(network, rows, width):
     return resolved
 
 
+class Staging:
+    """Local, restartable spool. Only the coordinator changes budget accounting."""
+    def __init__(self, root, capacity, max_bytes):
+        self.root = root / "staging"
+        if self.root.is_symlink():
+            raise ValueError("staging must remain on the local disk beside state.sqlite3")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.capacity, self.max_bytes = capacity, max_bytes
+        self.sizes = {}
+        self.reserved = set()
+        # Incomplete local writes have no valid manifest and can be downloaded again.
+        for path in self.root.glob("images/*/*"):
+            if not re.fullmatch(r"[0-9a-f]{64}", path.stem):
+                continue
+            if path.suffix == ".part":
+                path.unlink()
+            elif path.suffix in EXTENSIONS.values():
+                if not self.manifest(path.stem).exists():
+                    path.unlink()
+                else:
+                    self.sizes[path.stem] = self.sizes.get(path.stem, 0) + path.stat().st_size
+        for path in self.root.glob("*.json.part"):
+            if re.fullmatch(r"[0-9a-f]{64}\.json\.part", path.name):
+                path.unlink()
+
+    def manifest(self, file_id):
+        return self.root / f"{file_id}.json"
+
+    @property
+    def used(self):
+        return sum(max(size, self.max_bytes) if key in self.reserved else size
+                   for key, size in self.sizes.items()) + sum(
+                       self.max_bytes for key in self.reserved if key not in self.sizes)
+
+    def reserve(self, file_id):
+        extra = max(0, self.max_bytes - self.sizes.get(file_id, 0))
+        if self.used + extra > self.capacity:
+            return False
+        self.reserved.add(file_id)
+        return True
+
+    def remove_files(self, file_id):
+        self.manifest(file_id).unlink(missing_ok=True)
+        for path in (self.root / "images" / file_id[:2]).glob(f"{file_id}.*"):
+            if path.suffix in {*EXTENSIONS.values(), ".part"}:
+                path.unlink()
+
+    def release(self, file_id, *, discard=False):
+        if discard:
+            self.remove_files(file_id)
+        self.reserved.discard(file_id)
+        size = sum(path.stat().st_size for path in
+                   (self.root / "images" / file_id[:2]).glob(f"{file_id}.*")
+                   if path.suffix in EXTENSIONS.values())
+        if size:
+            self.sizes[file_id] = size
+        else:
+            self.sizes.pop(file_id, None)
+
+    def fetch(self, network, row):
+        file_id, url = row["file_id"], row["info"]["download_url"]
+        started = time.monotonic()
+        try:
+            result = json.loads(self.manifest(file_id).read_text())
+            allowed = {f"images/{file_id[:2]}/{file_id}{ext}" for ext in EXTENSIONS.values()}
+            if result["path"] not in allowed or result["download_url"] != url:
+                raise ValueError("Staged source changed")
+            path = self.root / result["path"]
+            if path.stat().st_size != result["nbytes"] or result["nbytes"] > self.max_bytes:
+                raise ValueError("Staged image size changed")
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest() != result["sha256"]:
+                raise ValueError("Staged image checksum changed")
+            return {**result, "fetch_seconds": time.monotonic() - started, "cache_hit": True}
+        except (FileNotFoundError, KeyError, TypeError, ValueError):
+            self.remove_files(file_id)
+        result = network.image(url, self.root, file_id, self.max_bytes)
+        result["download_url"] = url
+        with atomic_text(self.manifest(file_id)) as stream:
+            stream.write(encode(result))
+            stream.flush()
+            os.fsync(stream.fileno())
+        return {**result, "fetch_seconds": time.monotonic() - started, "cache_hit": False}
+
+
+def store_image(staging_root, output_root, result, retries=2):
+    """Publish a verified local file. The DB commit is the completion boundary.
+
+    Writing the final key avoids remote .part uploads, rereads and copy/delete
+    renames. On interruption it remains uncommitted and will be overwritten.
+    """
+    started = time.monotonic()
+    source, target = staging_root / result["path"], output_root / result["path"]
+    for attempt in range(retries + 1):
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            digest, size = hashlib.sha256(), 0
+            with source.open("rb") as src, target.open("wb") as dst:
+                for block in iter(lambda: src.read(1024 * 1024), b""):
+                    dst.write(block)
+                    digest.update(block)
+                    size += len(block)
+                if size != result["nbytes"] or digest.hexdigest() != result["sha256"]:
+                    raise ValueError("Staged image changed during upload; retained for retry")
+                dst.flush()
+                os.fsync(dst.fileno())
+            return {**result, "store_seconds": time.monotonic() - started}
+        except OSError as exc:
+            if exc.errno in (28, 13, 30) or attempt == retries:
+                raise
+            LOG.warning("Storage retry %d/%d for %s: %s", attempt + 1, retries, result["path"], exc)
+            time.sleep(2 ** attempt)
+
+
+class DownloadProgress:
+    def __init__(self, total, interval):
+        self.total, self.interval = total, interval
+        self.processed = self.failures = self.stored_bytes = 0
+        self.fetch_seconds = self.store_seconds = 0.0
+        self.fetched = self.stored = self.cache_hits = 0
+        self.last_at = time.monotonic()
+        self.samples = deque([(self.last_at, 0, 0)])
+
+    def report(self, staging, active, force=False):
+        current = time.monotonic()
+        if not force and current - self.last_at < self.interval:
+            return
+        self.samples.append((current, self.processed, self.stored_bytes))
+        while len(self.samples) > 2 and self.samples[1][0] < current - 60:
+            self.samples.popleft()
+        at, count, size = self.samples[0]
+        elapsed = max(current - at, 0.001)
+        rate = (self.processed - count) / elapsed
+        remaining = max(0, self.total - self.processed)
+        eta = f"{remaining / rate / 3600:.1f}h" if rate else "unknown"
+        LOG.info("This run: %d processed, %d failed | %.2f files/s | %.2f MiB/s stored | "
+                 "remaining ~%d | ETA %s | avg fetch %.2fs, store %.2fs | "
+                 "%d staged reused | %d in flight | staging reserved %.1f/%.1f MiB",
+                 self.processed, self.failures, rate, (self.stored_bytes - size) / elapsed / 1024**2,
+                 remaining, eta, self.fetch_seconds / max(1, self.fetched),
+                 self.store_seconds / max(1, self.stored), self.cache_hits, active,
+                 staging.used / 1024**2, staging.capacity / 1024**2)
+        self.last_at = current
+
+
 def download(catalog, network, *, width=960, workers=2, limit=None,
-             retry_failed=False, max_bytes=20 * 1024**2, max_failures=10):
+             retry_failed=False, max_bytes=20 * 1024**2, max_failures=10,
+             upload_workers=4, staging_bytes=1024**3, skip_existing_check=False,
+             log_interval=15):
+    if workers not in (1, 2):
+        raise ValueError("--workers must be 1 or 2 (Wikimedia media concurrency)")
+    if upload_workers < 1 or staging_bytes < max_bytes:
+        raise ValueError("Upload workers must be positive; --staging-mib must cover --max-image-mib")
     catalog.bind("image_width", width)
     catalog.db.commit()
-    cursor = ""
-    processed = failures = consecutive = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    network.cancel.clear()
+    staging = Staging(catalog.root, staging_bytes, max_bytes)
+    eligible = "status!='downloaded'" if retry_failed else "status='pending'"
+    total = catalog.db.execute(f"SELECT COUNT(*) FROM files WHERE {eligible}").fetchone()[0]
+    progress = DownloadProgress(min(total, limit) if limit is not None else total, log_interval)
+    ready, futures = deque(), {}
+    consecutive = selected = 0
+    exhausted = False
+    fatal = None
+    # Every in-flight image reserves its maximum possible size before fetching.
+    window = min(32, max(1, staging_bytes // max_bytes))
+    LOG.info("Download pipeline: %d media connections, %d storage workers, %d-file window, "
+             "%.1f Mbps media cap; local staging: %s", workers, upload_workers, window,
+             network.bandwidth.bytes_per_second * 8 / 1_000_000, staging.root)
+
+    def candidates():
+        resumed = set()
+        # Prioritize retained uploads so a full spool can drain on restart.
+        for file_id in list(staging.sizes):
+            row = catalog.db.execute("SELECT * FROM files WHERE file_id=?", (file_id,)).fetchone()
+            if row is None or row["status"] == "downloaded":
+                staging.release(file_id, discard=True)
+            elif row["status"] != "failed" or retry_failed:
+                resumed.add(file_id)
+                yield dict(row)
+        cursor = ""
         while True:
-            # Include completed rows to cheaply detect missing/truncated local files.
-            rows = catalog.db.execute("""SELECT file_id,filename,status,path,nbytes
-                FROM files WHERE file_id>? ORDER BY file_id LIMIT 100""", (cursor,)).fetchall()
+            # The optional fast resume avoids stat calls through an object mount.
+            condition = f"AND ({eligible})" if skip_existing_check else ""
+            rows = catalog.db.execute(f"""SELECT file_id,filename,status,path,nbytes,info
+                FROM files WHERE file_id>? {condition} ORDER BY file_id LIMIT 100""", (cursor,)).fetchall()
             if not rows:
-                break
+                return
             cursor = rows[-1]["file_id"]
-            pending = []
             for row in rows:
-                if row["status"] == "failed" and not retry_failed:
+                if row["file_id"] in resumed or (row["status"] == "failed" and not retry_failed):
                     continue
-                if row["status"] == "downloaded" and row["path"]:
-                    path = catalog.root / row["path"]
-                    if path.is_file() and path.stat().st_size == row["nbytes"]:
+                if row["status"] == "downloaded":
+                    path = catalog.root / row["path"] if row["path"] else None
+                    if path and path.is_file() and path.stat().st_size == row["nbytes"]:
                         continue
-                pending.append(dict(row))
-            if limit is not None:
-                pending = pending[:max(0, limit - processed)]
-            for start in range(0, len(pending), 5):
-                batch = pending[start:start + 5]
-                need_info = []
-                for row in batch:
-                    cached = catalog.db.execute("SELECT info FROM files WHERE file_id=?", (row["file_id"],)).fetchone()[0]
-                    row["info"] = json.loads(cached) if cached and row["status"] != "failed" else None
-                    if not row["info"]:
-                        need_info.append(row)
-                if need_info:
-                    # A whole API-batch failure stops this run, preserving pending work.
-                    resolved = resolve_files(network, need_info, width)
-                    for row in need_info:
-                        row["info"] = resolved[row["file_id"]]
-                        catalog.db.execute("UPDATE files SET info=? WHERE file_id=?",
-                                           (encode(row["info"]), row["file_id"]))
-                    catalog.db.commit()
-                futures = {}
-                for row in batch:
-                    catalog.db.execute("UPDATE files SET attempts=attempts+1 WHERE file_id=?", (row["file_id"],))
-                    info = row["info"]
-                    if info.get("error"):
-                        catalog.db.execute("UPDATE files SET status='failed',error=?,updated_at=? WHERE file_id=?",
-                                           (info["error"], now(), row["file_id"]))
-                        failures += 1
-                        consecutive += 1
-                        processed += 1
-                    else:
-                        future = pool.submit(network.image, info["download_url"], catalog.root, row["file_id"], max_bytes)
-                        futures[future] = row
-                catalog.db.commit()
-                for future in as_completed(futures):
-                    row = futures[future]
+                    progress.total = min(progress.total + 1, limit) if limit is not None else progress.total + 1
+                yield dict(row)
+
+    rows = iter(candidates())
+
+    def fail(row, exc):
+        nonlocal consecutive
+        if isinstance(exc, OSError) and exc.errno in (28, 13, 30):
+            raise exc
+        message = f"{type(exc).__name__}: {exc}"[:2000]
+        LOG.warning("Failed %s: %s", row["filename"], message)
+        catalog.db.execute("UPDATE files SET status='failed',error=?,updated_at=? WHERE file_id=?",
+                           (message, now(), row["file_id"]))
+        catalog.db.commit()
+        progress.processed += 1
+        progress.failures += 1
+        consecutive += 1
+        if consecutive >= max_failures and fatal is None:
+            raise ValueError(f"Stopped after {consecutive} consecutive failures; inspect connectivity/storage and retry.")
+
+    with ThreadPoolExecutor(max_workers=1) as metadata_pool, \
+            ThreadPoolExecutor(max_workers=workers) as image_pool, \
+            ThreadPoolExecutor(max_workers=upload_workers) as upload_pool:
+        while True:
+            try:
+                for future in [f for f in futures if f.done()]:
+                    kind, job = futures.pop(future)
                     try:
                         result = future.result()
-                    except (httpx.HTTPError, RetryableError, ValueError, OSError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
-                        if isinstance(exc, OSError) and exc.errno in (28, 13, 30):
-                            raise  # Disk full/permissions/read-only filesystem are run failures.
-                        message = f"{type(exc).__name__}: {exc}"[:2000]
-                        LOG.warning("Failed %s: %s", row["filename"], message)
-                        catalog.db.execute("UPDATE files SET status='failed',error=?,updated_at=? WHERE file_id=?",
-                                           (message, now(), row["file_id"]))
-                        failures += 1
-                        consecutive += 1
+                    except CancelledError:
+                        if kind != "metadata":
+                            staging.release(job["file_id"])
+                        continue
+                    except (httpx.HTTPError, RetryableError, ValueError, OSError,
+                            Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+                        if kind == "metadata":
+                            raise  # A failed API batch remains pending.
+                        staging.release(job["file_id"])
+                        fail(job, exc)
+                        continue
+                    if kind == "metadata":
+                        for row in job:
+                            row["info"] = result[row["file_id"]]
+                            catalog.db.execute("UPDATE files SET info=? WHERE file_id=?",
+                                               (encode(row["info"]), row["file_id"]))
+                        catalog.db.commit()
+                        if fatal is None:
+                            ready.extend(job)
+                    elif kind == "fetch":
+                        progress.fetch_seconds += result["fetch_seconds"]
+                        progress.fetched += 1
+                        progress.cache_hits += int(result["cache_hit"])
+                        if fatal is None:
+                            task = upload_pool.submit(store_image, staging.root, catalog.root, result)
+                            futures[task] = ("store", job)
+                        else:
+                            staging.release(job["file_id"])
                     else:
                         catalog.db.execute("""UPDATE files SET status='downloaded',path=?,sha256=?,
                             nbytes=?,width=?,height=?,error=NULL,updated_at=? WHERE file_id=?""",
                             (result["path"], result["sha256"], result["nbytes"], result["width"],
-                             result["height"], now(), row["file_id"]))
+                             result["height"], now(), job["file_id"]))
+                        catalog.db.commit()
+                        # Never discard the only verified local copy before committing.
+                        staging.release(job["file_id"], discard=True)
+                        progress.processed += 1
+                        progress.stored += 1
+                        progress.stored_bytes += result["nbytes"]
+                        progress.store_seconds += result["store_seconds"]
                         consecutive = 0
-                    processed += 1
-                    catalog.db.commit()
-                LOG.info("This run: %d processed, %d failed", processed, failures)
-                if consecutive >= max_failures:
-                    raise ValueError(f"Stopped after {consecutive} consecutive failures; inspect connectivity/quota and retry.")
-            if limit is not None and processed >= limit:
-                break
-    return processed, failures
+
+                if fatal is None:
+                    fetching = sum(kind == "fetch" for kind, _ in futures.values())
+                    for _ in range(len(ready)):
+                        row = ready[0]
+                        if row["info"].get("error"):
+                            ready.popleft()
+                            catalog.db.execute("UPDATE files SET status='pending',attempts=attempts+1 WHERE file_id=?", (row["file_id"],))
+                            fail(row, ValueError(row["info"]["error"]))
+                        elif fetching < workers and staging.reserve(row["file_id"]):
+                            ready.popleft()
+                            # A previously completed but missing/truncated file must
+                            # stop being "downloaded" before its key is overwritten.
+                            catalog.db.execute("UPDATE files SET status='pending',attempts=attempts+1 WHERE file_id=?", (row["file_id"],))
+                            catalog.db.commit()
+                            task = image_pool.submit(staging.fetch, network, row)
+                            futures[task] = ("fetch", row)
+                            fetching += 1
+                        else:
+                            ready.rotate(-1)
+                    metadata_active = any(kind == "metadata" for kind, _ in futures.values())
+                    free = window - len(ready) - len(futures)
+                    if not exhausted and not metadata_active and free >= min(5, window):
+                        batch = []
+                        for _ in range(min(5, free)):
+                            if limit is not None and selected >= limit:
+                                exhausted = True
+                                break
+                            row = next(rows, None)
+                            if row is None:
+                                exhausted = True
+                                break
+                            selected += 1
+                            cached = row["info"]
+                            row["info"] = json.loads(cached) if cached and (
+                                row["status"] != "failed" or row["file_id"] in staging.sizes) else None
+                            if row["info"]:
+                                ready.append(row)
+                            else:
+                                batch.append(row)
+                        if batch:
+                            futures[metadata_pool.submit(resolve_files, network, batch, width)] = ("metadata", batch)
+                        # Fill download slots immediately after reading cached metadata.
+                        continue
+                    if not futures and ready:
+                        raise ValueError("Local staging is full; retained uploads need --retry-failed "
+                                         "or a larger --staging-mib. No staged images were discarded.")
+                if not futures and (fatal is not None or exhausted):
+                    break
+                progress.report(staging, len(futures))
+                if futures:
+                    wait(futures, timeout=min(1, log_interval), return_when=FIRST_COMPLETED)
+            except BaseException as exc:
+                if fatal is not None:
+                    if isinstance(exc, KeyboardInterrupt):
+                        raise
+                    LOG.warning("Additional error while stopping: %s: %s", type(exc).__name__, exc)
+                    continue
+                fatal = exc
+                LOG.warning("Stopping new work; preserving local staged images and finishing active storage writes.")
+                network.cancel.set()
+                ready.clear()
+                for future in futures:
+                    future.cancel()
+    progress.report(staging, 0, force=True)
+    if fatal is not None:
+        raise fatal
+    return progress.processed, progress.failures
 
 
 def verify(catalog, repair=False):
@@ -638,6 +931,13 @@ def positive(value):
     return number
 
 
+def positive_float(value):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return number
+
+
 def parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--output", type=Path, default=Path("data/p18"))
@@ -655,7 +955,14 @@ def parser():
     cmd.add_argument("--scope", choices=("all", "humans"), default="all")
     cmd = commands.add_parser("download", parents=[common], help="Download pending thumbnails; resume by repeating")
     cmd.add_argument("--width", type=int, default=None, help="Thumbnail width, default 960; 0 requests originals")
-    cmd.add_argument("--workers", type=positive, default=2)
+    cmd.add_argument("--workers", type=positive, default=2, help="Wikimedia image connections: 1 or 2 (default 2)")
+    cmd.add_argument("--upload-workers", type=positive, default=4, help="Concurrent writes to image storage (default 4)")
+    cmd.add_argument("--bandwidth-mbps", type=positive_float, default=25, help="Shared media bandwidth cap, at most 25 Mbps")
+    cmd.add_argument("--staging-mib", type=positive, default=1024, help="Local staged image budget in MiB (default 1024)")
+    cmd.add_argument("--skip-existing-check", action="store_true",
+                     help="Trust downloaded DB entries without stat calls; use verify --repair to detect missing/corrupt files")
+    cmd.add_argument("--log-interval", type=positive_float, default=15, help="Progress report interval in seconds (default 15)")
+    cmd.add_argument("--verbose", action="store_true", help="Also log every HTTP request")
     cmd.add_argument("--limit", type=positive, help="Maximum unique files attempted this invocation")
     cmd.add_argument("--retry-failed", action="store_true")
     cmd.add_argument("--max-image-mib", type=positive, default=20)
@@ -679,8 +986,13 @@ def main(argv=None):
         if args.command == "download":
             if args.width is not None and args.width < 0:
                 raise ValueError("--width must be zero or positive")
-            if args.workers > 4:
-                raise ValueError("--workers must be at most 4; API/CDN rate limits still apply")
+            if args.workers > 2:
+                raise ValueError("--workers must be 1 or 2 (Wikimedia media concurrency)")
+            if args.bandwidth_mbps > 25:
+                raise ValueError("--bandwidth-mbps must be at most 25")
+            if args.staging_mib < args.max_image_mib:
+                raise ValueError("--staging-mib must cover --max-image-mib")
+            logging.getLogger("httpx").setLevel(logging.INFO if args.verbose else logging.WARNING)
         if args.command in {"status", "export", "verify", "download"} and not (args.output / "state.sqlite3").exists():
             raise ValueError("No catalog exists here. Run sample or import-dump first.")
         if args.command == "status":
@@ -692,6 +1004,8 @@ def main(argv=None):
             return 0
         # Validate contact before creating a network job's output directory.
         network = Network(args.user_agent) if args.command in {"sample", "download"} else None
+        if args.command == "download":
+            network.bandwidth = BandwidthLimiter(args.bandwidth_mbps, cancel=network.cancel)
         try:
             with output_lock(args.output):
                 catalog = Catalog(args.output)
@@ -704,7 +1018,9 @@ def main(argv=None):
                         width = args.width if args.width is not None else catalog.get("image_width", 960)
                         download(catalog, network, width=width, workers=args.workers, limit=args.limit,
                                  retry_failed=args.retry_failed, max_bytes=args.max_image_mib * 1024**2,
-                                 max_failures=args.max_consecutive_failures)
+                                 max_failures=args.max_consecutive_failures, upload_workers=args.upload_workers,
+                                 staging_bytes=args.staging_mib * 1024**2, skip_existing_check=args.skip_existing_check,
+                                 log_interval=args.log_interval)
                     elif args.command == "export":
                         export(catalog)
                     elif args.command == "verify":

@@ -247,6 +247,48 @@ class Tests(unittest.TestCase):
         good = self.network(self.commons)
         self.assertEqual(p18.download(self.catalog, good, retry_failed=True), (1, 0))
 
+    def test_retry_mpo_named_jpg_preserves_bytes_and_resume(self):
+        stream = io.BytesIO()
+        Image.new("RGB", (32, 24), (120, 50, 20)).save(
+            stream, "MPO", save_all=True,
+            append_images=[Image.new("RGB", (32, 24), (20, 50, 120))])
+        payload = stream.getvalue()
+        self.add(entity(filename="Portrait with MPF.jpg"))
+        self.catalog.db.execute("""UPDATE files SET status='failed',
+            error='ValueError: Unsupported raster format: MPO'""")
+        self.catalog.db.commit()
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.host)
+            if request.url.host == "commons.wikimedia.org":
+                return httpx.Response(200, json={"query": {"pages": [{
+                    "title": "File:Portrait with MPF.jpg", "imageinfo": [{
+                        "url": "https://upload.wikimedia.org/portrait.jpg",
+                        "width": 32, "height": 24, "mime": "image/jpeg"}]}]}})
+            return httpx.Response(200, content=payload)
+
+        network = self.network(handler)
+        self.assertEqual(p18.download(self.catalog, network, width=500, retry_failed=True), (1, 0))
+        row = self.catalog.db.execute("SELECT * FROM files").fetchone()
+        path = self.catalog.root / row["path"]
+        self.assertEqual(row["status"], "downloaded")
+        self.assertIsNone(row["error"])
+        self.assertEqual(path.suffix, ".mpo")
+        self.assertEqual(path.read_bytes(), payload)
+        self.assertEqual(row["nbytes"], len(payload))
+        self.assertEqual(row["sha256"], hashlib.sha256(payload).hexdigest())
+        self.assertEqual((row["width"], row["height"]), (32, 24))
+        with Image.open(path) as image:
+            self.assertEqual(image.n_frames, 2)
+            image.seek(1)
+            image.load()
+        self.assertEqual(p18.verify(self.catalog), {"verified": 1, "invalid": 0, "requeued": 0})
+        self.assertEqual(calls, ["commons.wikimedia.org", "upload.wikimedia.org"])
+        calls.clear()
+        self.assertEqual(p18.download(self.catalog, network, width=500, retry_failed=True), (0, 0))
+        self.assertEqual(calls, [])
+
     def test_thumbnail_size_guard(self):
         self.add()
         result = p18.download(self.catalog, self.network(self.commons), max_bytes=1)
