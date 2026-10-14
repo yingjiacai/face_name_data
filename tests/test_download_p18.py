@@ -1,4 +1,5 @@
 import bz2
+from contextlib import redirect_stdout
 import gzip
 import hashlib
 import importlib.util
@@ -110,6 +111,86 @@ class Tests(unittest.TestCase):
         self.assertEqual((summary["entities"], summary["name_image_pairs"], summary["unique_commons_files"]), (2, 2, 1))
         self.assertEqual(record["name"], "Q90")
         self.assertTrue(record["name_is_qid_fallback"])
+
+    def test_require_label_excludes_qid_fallback(self):
+        item = entity("Q90")
+        item["labels"] = {}
+        self.assertIsNone(p18.entity_record(item, "humans", {}, require_label=True))
+        self.assertIsNotNone(p18.entity_record(item, "humans", {}, require_label=False))
+
+    def test_cli_defaults_new_imports_and_samples_to_humans(self):
+        imported = p18.parser().parse_args(["import-dump", "--dump", "snapshot.json"])
+        sampled = p18.parser().parse_args(["sample"])
+        self.assertEqual(imported.scope, "humans")
+        self.assertEqual(sampled.scope, "humans")
+        self.assertFalse(imported.require_label)
+
+    def test_derive_builds_clean_named_human_catalog_without_touching_source(self):
+        named = entity("Q1", "Shared.jpg")
+        city = entity("Q2", "Shared.jpg", human=False)
+        unnamed = entity("Q3", "Unnamed.jpg")
+        unnamed["labels"] = {}
+        second = entity("Q4", "Second.jpg")
+        for item in (named, city, unnamed, second):
+            self.add(item)
+        shared_id = hashlib.sha256(b"Shared.jpg").hexdigest()
+        unnamed_id = hashlib.sha256(b"Unnamed.jpg").hexdigest()
+        self.catalog.db.execute(
+            """UPDATE files SET status='downloaded',info='{}',path='images/a/file.jpg',
+               sha256='hash',nbytes=123,width=10,height=20,attempts=2
+               WHERE file_id=?""", (shared_id,))
+        self.catalog.db.execute(
+            "UPDATE files SET status='failed',error='old failure',attempts=3 WHERE file_id=?",
+            (unnamed_id,))
+        self.catalog.set("catalog_source", {"kind": "dump", "scope": "all",
+                                             "file": {"edge_sha256": "fixture"}})
+        self.catalog.set("dump_progress", {"complete": True, "matched": 4})
+        self.catalog.db.commit()
+        original = self.catalog.summary()
+
+        dry_output = self.root / "dry-does-not-exist"
+        plan = p18.derive_human_catalog(
+            self.catalog, dry_output, require_label=True, dry_run=True)
+        self.assertFalse(dry_output.exists())
+        self.assertEqual((plan["entities"], plan["name_image_pairs"],
+                          plan["unique_commons_files"]), (2, 2, 2))
+        self.assertEqual(plan["source_file_status"], {"downloaded": 1, "pending": 1})
+        self.assertEqual(plan["human_entities_without_labels"], 1)
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(p18.main([
+                "derive", "--source", str(self.catalog.root),
+                "--output", str(dry_output), "--scope", "humans",
+                "--require-label", "--dry-run"]), 0)
+        self.assertEqual(json.loads(stdout.getvalue())["entities"], 2)
+
+        target_root = self.root / "humans"
+        target_root.mkdir()
+        report = p18.derive_human_catalog(self.catalog, target_root, require_label=True)
+        self.assertFalse(report["dry_run"])
+        self.assertEqual(report["new_file_status"], {"pending": 2})
+        target = p18.Catalog(target_root, readonly=True)
+        try:
+            summary = target.summary()
+            self.assertEqual((summary["entities"], summary["name_image_pairs"],
+                              summary["unique_commons_files"]), (2, 2, 2))
+            self.assertEqual(summary["file_status"], {"pending": 2})
+            self.assertEqual(summary["downloaded_bytes"], 0)
+            self.assertEqual(summary["catalog_source"]["kind"], "derived")
+            self.assertTrue(summary["catalog_source"]["downloads_reset"])
+            self.assertEqual(
+                {row[0] for row in target.db.execute("SELECT qid FROM entities")},
+                {"Q1", "Q4"})
+            rows = target.db.execute(
+                "SELECT info,path,sha256,nbytes,width,height,error,attempts FROM files").fetchall()
+            self.assertTrue(all(tuple(row) == (None, None, None, None, None, None, None, 0)
+                                for row in rows))
+        finally:
+            target.close()
+        self.assertEqual(self.catalog.summary(), original)
+        self.assertFalse((target_root / "images").exists())
+        with self.assertRaisesRegex(ValueError, "must be empty"):
+            p18.derive_human_catalog(self.catalog, target_root, require_label=True)
 
     def test_dump_resume_gzip_bz2_plain_without_qid_order_assumption(self):
         data = b"[\n" + b",\n".join(json.dumps(entity(qid)).encode() for qid in ("Q90", "Q42", "Q517")) + b"\n]\n"

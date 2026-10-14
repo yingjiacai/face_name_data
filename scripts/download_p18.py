@@ -25,6 +25,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -85,7 +86,7 @@ def value_of(statement):
     return snak.get("datavalue", {}).get("value")
 
 
-def entity_record(entity, scope, source):
+def entity_record(entity, scope, source, require_label=False):
     """Keep all non-deprecated P18 statements, including qualifiers/references."""
     qid = entity.get("id", "")
     if not ID_RE.fullmatch(qid):
@@ -105,6 +106,8 @@ def entity_record(entity, scope, source):
     if not files:
         return None
     labels = {lang: item["value"] for lang, item in entity.get("labels", {}).items()}
+    if require_label and not labels:
+        return None
     names = [labels.get(lang) for lang in ("zh", "zh-hans", "en")]
     name = next((n for n in names if n), next(iter(labels.values()), qid))
     return {"qid": qid, "name": name, "name_is_qid_fallback": not bool(labels),
@@ -209,11 +212,13 @@ def output_lock(root):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def import_dump(catalog, path, scope="all", limit=None):
+def import_dump(catalog, path, scope="all", limit=None, require_label=False):
     path = Path(path).resolve()
     if path.name.endswith(".part"):
         raise ValueError("Finish the dump download before importing its .part file.")
     source = {"kind": "dump", "scope": scope, "file": fingerprint(path)}
+    if require_label:
+        source["require_label"] = True
     catalog.bind("catalog_source", source)
     progress = catalog.get("dump_progress", {"offset": 0, "lines": 0, "matched": 0,
                                              "complete": False, "array": None})
@@ -254,7 +259,8 @@ def import_dump(catalog, path, scope="all", limit=None):
                 # prefilter avoids decoding the overwhelming majority of entities.
                 if b'"P18"' in content:
                     entity = json.loads(content.rstrip(b","))
-                    record = entity_record(entity, scope, {"kind": "dump", "filename": path.name})
+                    record = entity_record(entity, scope, {"kind": "dump", "filename": path.name},
+                                           require_label=require_label)
                     if record:
                         catalog.add(record)
                         selected += 1
@@ -272,6 +278,129 @@ def import_dump(catalog, path, scope="all", limit=None):
         catalog.set("dump_progress", progress)
         catalog.db.commit()
     LOG.info("Import paused/finished: %s", encode(progress))
+
+
+def human_subset_stats(source, require_label=False):
+    """Count a human-only view of an existing catalog without changing it."""
+    source.db.execute("DROP TABLE IF EXISTS temp.human_selection")
+    source.db.execute(
+        """CREATE TEMP TABLE human_selection(
+               qid TEXT PRIMARY KEY, missing_label INTEGER NOT NULL) WITHOUT ROWID""")
+    try:
+        # Parse each large entity JSON once; later counts use only compact QIDs.
+        source.db.execute(
+            """INSERT INTO human_selection
+               SELECT qid,COALESCE(json_extract(data,'$.name_is_qid_fallback'),1)
+               FROM entities WHERE json_extract(data,'$.is_human')=1""")
+        selected = "WHERE h.missing_label=0" if require_label else ""
+        entities = source.db.execute(
+            f"SELECT COUNT(*) FROM human_selection h {selected}").fetchone()[0]
+        pairs = source.db.execute(
+            f"""SELECT COUNT(*) FROM pairs p JOIN human_selection h USING(qid)
+                {selected}""").fetchone()[0]
+        rows = source.db.execute(
+            f"""WITH selected AS (
+                    SELECT DISTINCT p.file_id FROM pairs p
+                    JOIN human_selection h USING(qid) {selected}
+                )
+                SELECT f.status,COUNT(*),COALESCE(SUM(f.nbytes),0)
+                FROM selected s JOIN files f USING(file_id) GROUP BY f.status""").fetchall()
+        status = {row[0]: row[1] for row in rows}
+        downloaded_bytes = sum(row[2] for row in rows if row[0] == "downloaded")
+        missing_labels = source.db.execute(
+            "SELECT COUNT(*) FROM human_selection WHERE missing_label=1").fetchone()[0]
+        unique_files = sum(status.values())
+        return {"scope": "humans", "require_label": require_label,
+                "entities": entities, "name_image_pairs": pairs,
+                "unique_commons_files": unique_files,
+                "source_file_status": status,
+                "source_downloaded_bytes": downloaded_bytes,
+                "human_entities_without_labels": missing_labels,
+                "new_file_status": {"pending": unique_files}}
+    finally:
+        source.db.execute("DROP TABLE temp.human_selection")
+
+
+def derive_human_catalog(source, output, require_label=False, dry_run=False):
+    """Build a clean human-only catalog from a completed catalog.
+
+    Entity and relationship data are copied, while every image is reset to
+    pending. The source database and its image directory are never changed.
+    """
+    source_description = source.get("catalog_source")
+    progress = source.get("dump_progress")
+    if not source_description or source_description.get("scope") not in ("all", "humans"):
+        raise ValueError("Source catalog has no supported scope metadata")
+    if not progress or not progress.get("complete"):
+        raise ValueError("Source dump import is incomplete")
+    stats = human_subset_stats(source, require_label)
+    if dry_run:
+        return {"dry_run": True, **stats}
+    if not stats["entities"] or not stats["unique_commons_files"]:
+        raise ValueError("Human filter selected no entities or images")
+
+    output = Path(output).resolve()
+    existing = [path.name for path in output.iterdir() if path.name != ".writer.lock"]
+    if existing:
+        raise ValueError(f"Derived output must be empty; found: {', '.join(sorted(existing)[:5])}")
+
+    condition = "json_extract(e.data,'$.is_human')=1"
+    if require_label:
+        condition += " AND COALESCE(json_extract(e.data,'$.name_is_qid_fallback'),1)=0"
+    with tempfile.TemporaryDirectory(prefix=".derive-", dir=output) as temporary:
+        target = Catalog(Path(temporary))
+        try:
+            # This database is disposable until the final atomic rename. DELETE
+            # mode avoids a second multi-gigabyte WAL during bulk insertion.
+            target.db.execute("PRAGMA journal_mode=DELETE")
+            target.db.execute("PRAGMA synchronous=NORMAL")
+            target.db.execute("ATTACH DATABASE ? AS source_db",
+                              (str(source.root / "state.sqlite3"),))
+            target.db.execute(
+                f"""INSERT INTO entities(qid,data)
+                    SELECT e.qid,e.data FROM source_db.entities e WHERE {condition}""")
+            target.db.execute(
+                "CREATE TEMP TABLE selected_files(file_id TEXT PRIMARY KEY) WITHOUT ROWID")
+            target.db.execute(
+                """INSERT INTO selected_files
+                   SELECT DISTINCT p.file_id FROM source_db.pairs p
+                   JOIN main.entities e USING(qid)""")
+            # Only identity and filename are copied. Download state, cached URLs,
+            # hashes and paths intentionally start clean in the new catalog.
+            target.db.execute(
+                """INSERT INTO files(file_id,filename)
+                   SELECT f.file_id,f.filename FROM source_db.files f
+                   JOIN selected_files s USING(file_id)""")
+            target.db.execute(
+                """INSERT INTO pairs(qid,file_id)
+                   SELECT p.qid,p.file_id FROM source_db.pairs p
+                   JOIN main.entities e USING(qid)
+                   JOIN selected_files s USING(file_id)""")
+            target.set("catalog_source", {
+                "kind": "derived", "scope": "humans",
+                "require_label": require_label, "downloads_reset": True,
+                "created_at": now(), "source_catalog": str(source.root),
+                "source": source_description})
+            target.set("dump_progress", {
+                "complete": True, "derived": True,
+                "source_dump_progress": progress})
+            target.db.commit()
+            problems = target.db.execute("PRAGMA foreign_key_check").fetchall()
+            integrity = target.db.execute("PRAGMA integrity_check").fetchone()[0]
+            summary = target.summary()
+            if problems or integrity != "ok":
+                raise ValueError("Derived catalog failed SQLite integrity checks")
+            if (summary["entities"] != stats["entities"] or
+                    summary["name_image_pairs"] != stats["name_image_pairs"] or
+                    summary["unique_commons_files"] != stats["unique_commons_files"] or
+                    summary["file_status"] != stats["new_file_status"]):
+                raise ValueError("Derived catalog counts differ from the read-only plan")
+            target.db.execute("DETACH DATABASE source_db")
+        finally:
+            target.close()
+        os.replace(Path(temporary) / "state.sqlite3", output / "state.sqlite3")
+    return {"dry_run": False, **stats,
+            "output": str(output), "downloaded_bytes": 0}
 
 
 class RetryableError(Exception):
@@ -317,27 +446,50 @@ class RateLimiter:
 
 
 class BandwidthLimiter:
-    """Share a byte budget across media connections, including retries."""
-    def __init__(self, mbps=25, cancel=None, clock=None, sleep=None):
+    """Share an exact rolling-window byte budget across media connections."""
+    def __init__(self, mbps=25, cancel=None, clock=None, sleep=None, window_seconds=10):
         if not math.isfinite(mbps) or not 0 < mbps <= 25:
             raise ValueError("--bandwidth-mbps must be greater than 0 and at most 25")
+        if not math.isfinite(window_seconds) or window_seconds <= 0:
+            raise ValueError("Bandwidth window must be finite and positive")
         self.bytes_per_second = mbps * 1_000_000 / 8
-        self.next_at = 0.0
+        self.window_seconds = window_seconds
+        self.capacity = self.bytes_per_second * window_seconds
+        self.events = deque()
+        self.used = 0
         self.lock = threading.Lock()
         self.cancel = cancel or threading.Event()
         self.clock = clock or time.monotonic
         self.sleep = sleep or self.cancel.wait
 
     def consume(self, size):
-        if self.cancel.is_set():
-            raise CancelledError()
-        with self.lock:
-            current = self.clock()
-            self.next_at = max(current, self.next_at) + size / self.bytes_per_second
-            delay = self.next_at - current
-        self.sleep(delay)
-        if self.cancel.is_set():
-            raise CancelledError()
+        if size < 0 or size > self.capacity:
+            raise ValueError("Bandwidth chunk exceeds the rolling-window budget")
+        waited = 0.0
+        while size:
+            if self.cancel.is_set():
+                raise CancelledError()
+            with self.lock:
+                current = self.clock()
+                cutoff = current - self.window_seconds
+                while self.events and self.events[0][0] <= cutoff:
+                    _, expired = self.events.popleft()
+                    self.used -= expired
+                if self.used + size <= self.capacity:
+                    self.events.append((current, size))
+                    self.used += size
+                    return waited
+                released = 0
+                release_at = current
+                for recorded_at, recorded_size in self.events:
+                    released += recorded_size
+                    if self.used - released + size <= self.capacity:
+                        release_at = recorded_at + self.window_seconds
+                        break
+                delay = max(0.0, release_at - current)
+            self.sleep(delay)
+            waited += delay
+        return waited
 
 
 class Network:
@@ -408,6 +560,7 @@ class Network:
         def operation():
             digest = hashlib.sha256()
             count = 0
+            throttle_seconds = 0.0
             try:
                 with self.client.stream("GET", url) as response:
                     self.check_response(response)
@@ -415,7 +568,7 @@ class Network:
                         raise ValueError("Image exceeds --max-image-mib")
                     with partial.open("wb") as stream:
                         for block in response.iter_bytes(128 * 1024):
-                            self.bandwidth.consume(len(block))
+                            throttle_seconds += self.bandwidth.consume(len(block))
                             count += len(block)
                             if count > max_bytes:
                                 raise ValueError("Image exceeds --max-image-mib")
@@ -436,15 +589,18 @@ class Network:
                 target = directory / f"{file_id}{EXTENSIONS[image_format]}"
                 os.replace(partial, target)
                 return {"path": str(target.relative_to(root)), "sha256": digest.hexdigest(),
-                        "nbytes": count, "width": width, "height": height}
+                        "nbytes": count, "width": width, "height": height,
+                        "throttle_seconds": throttle_seconds}
             finally:
                 partial.unlink(missing_ok=True)
         return self.run("image", operation)
 
 
-def sample(catalog, network, limit=200, qids=None, scope="all"):
+def sample(catalog, network, limit=200, qids=None, scope="all", require_label=False):
     source = {"kind": "online_sample", "scope": scope,
               "qids": sorted(set(qids)) if qids else None, "limit": None if qids else limit}
+    if require_label:
+        source["require_label"] = True
     catalog.bind("catalog_source", source)
     if catalog.get("sample_complete", False):
         LOG.info("Sample already imported.")
@@ -479,7 +635,8 @@ def sample(catalog, network, limit=200, qids=None, scope="all"):
         for qid in batch:
             if qid not in entities:
                 raise ValueError(f"wbgetentities omitted {qid}; batch checkpoint was not advanced")
-            record = entity_record(entities[qid], scope, {"kind": "wikidata_api"})
+            record = entity_record(entities[qid], scope, {"kind": "wikidata_api"},
+                                   require_label=require_label)
             if record:
                 catalog.add(record)
             else:
@@ -619,7 +776,8 @@ class Staging:
                     digest.update(block)
             if digest.hexdigest() != result["sha256"]:
                 raise ValueError("Staged image checksum changed")
-            return {**result, "fetch_seconds": time.monotonic() - started, "cache_hit": True}
+            return {**result, "fetch_seconds": time.monotonic() - started,
+                    "throttle_seconds": 0.0, "cache_hit": True}
         except (FileNotFoundError, KeyError, TypeError, ValueError):
             self.remove_files(file_id)
         result = network.image(url, self.root, file_id, self.max_bytes)
@@ -665,6 +823,7 @@ class DownloadProgress:
         self.total, self.interval = total, interval
         self.processed = self.failures = self.stored_bytes = 0
         self.fetch_seconds = self.store_seconds = 0.0
+        self.throttle_seconds = 0.0
         self.fetched = self.stored = self.cache_hits = 0
         self.metadata_seconds = self.metadata_idle_seconds = 0.0
         self.metadata_batches = self.metadata_files = 0
@@ -684,12 +843,13 @@ class DownloadProgress:
         remaining = max(0, self.total - self.processed)
         eta = f"{remaining / rate / 3600:.1f}h" if rate else "unknown"
         LOG.info("This run: %d processed, %d failed | %.2f files/s | %.2f MiB/s stored | "
-                 "remaining ~%d | ETA %s | avg fetch %.2fs, store %.2fs | "
+                 "remaining ~%d | ETA %s | avg fetch %.2fs, throttle %.3fs, store %.2fs | "
                  "metadata %.2fs/batch, %.1f files/batch, link wait %.1fs | "
                  "%d fetching, %d storing, %d ready | "
                  "%d staged reused | %d in flight | staging reserved %.1f/%.1f MiB",
                  self.processed, self.failures, rate, (self.stored_bytes - size) / elapsed / 1024**2,
                  remaining, eta, self.fetch_seconds / max(1, self.fetched),
+                 self.throttle_seconds / max(1, self.fetched),
                  self.store_seconds / max(1, self.stored),
                  self.metadata_seconds / max(1, self.metadata_batches),
                  self.metadata_files / max(1, self.metadata_batches), self.metadata_idle_seconds,
@@ -833,6 +993,7 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                     elif kind == "fetch":
                         staging.fetched(job["file_id"], result["nbytes"])
                         progress.fetch_seconds += result["fetch_seconds"]
+                        progress.throttle_seconds += result.get("throttle_seconds", 0.0)
                         progress.fetched += 1
                         progress.cache_hits += int(result["cache_hit"])
                         if fatal is None:
@@ -1017,11 +1178,22 @@ def parser():
     cmd = commands.add_parser("sample", parents=[common], help="Small online sample or explicit QIDs; not exhaustive")
     cmd.add_argument("--limit", type=positive, default=200)
     cmd.add_argument("--qids", nargs="+")
-    cmd.add_argument("--scope", choices=("all", "humans"), default="all")
+    cmd.add_argument("--scope", choices=("all", "humans"), default="humans")
+    cmd.add_argument("--require-label", action="store_true",
+                     help="Exclude entities without any Wikidata label")
     cmd = commands.add_parser("import-dump", parents=[common], help="Stream a complete local .json/.json.gz/.json.bz2 dump")
     cmd.add_argument("--dump", type=Path, required=True)
     cmd.add_argument("--limit", type=positive, help="Pause after this many matching entities in this invocation")
-    cmd.add_argument("--scope", choices=("all", "humans"), default="all")
+    cmd.add_argument("--scope", choices=("all", "humans"), default="humans")
+    cmd.add_argument("--require-label", action="store_true",
+                     help="Exclude entities without any Wikidata label")
+    cmd = commands.add_parser("derive", help="Create a clean human-only catalog from a completed catalog")
+    cmd.add_argument("--source", type=Path, required=True, help="Existing completed catalog")
+    cmd.add_argument("--output", type=Path, required=True, help="New empty output directory")
+    cmd.add_argument("--scope", choices=("humans",), default="humans")
+    cmd.add_argument("--require-label", action="store_true",
+                     help="Exclude human entities without any Wikidata label")
+    cmd.add_argument("--dry-run", action="store_true", help="Only report selected counts")
     cmd = commands.add_parser("download", parents=[common], help="Download pending thumbnails; resume by repeating")
     cmd.add_argument("--width", type=int, default=None, help="Thumbnail width, default 960; 0 requests originals")
     cmd.add_argument("--workers", type=positive, default=2, help="Wikimedia image connections: 1 or 2 (default 2)")
@@ -1070,6 +1242,29 @@ def main(argv=None):
             if args.metadata_batch_size > 50:
                 raise ValueError("--metadata-batch-size must be at most 50")
             logging.getLogger("httpx").setLevel(logging.INFO if args.verbose else logging.WARNING)
+        if args.command == "derive":
+            source_root = args.source.resolve()
+            output_root = args.output.resolve()
+            if source_root == output_root:
+                raise ValueError("Derived output must differ from its source")
+            if not (source_root / "state.sqlite3").exists():
+                raise ValueError("Source catalog has no state.sqlite3")
+            if not args.dry_run and (output_root / "state.sqlite3").exists():
+                raise ValueError("Derived output already has state.sqlite3")
+            with output_lock(source_root):
+                source = Catalog(source_root, readonly=True)
+                try:
+                    if args.dry_run:
+                        report = derive_human_catalog(
+                            source, output_root, require_label=args.require_label, dry_run=True)
+                    else:
+                        with output_lock(output_root):
+                            report = derive_human_catalog(
+                                source, output_root, require_label=args.require_label)
+                finally:
+                    source.close()
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
         if args.command in {"status", "export", "verify", "download"} and not (args.output / "state.sqlite3").exists():
             raise ValueError("No catalog exists here. Run sample or import-dump first.")
         if args.command == "status":
@@ -1088,9 +1283,11 @@ def main(argv=None):
                 catalog = Catalog(args.output)
                 try:
                     if args.command == "sample":
-                        sample(catalog, network, args.limit, args.qids, args.scope)
+                        sample(catalog, network, args.limit, args.qids, args.scope,
+                               require_label=args.require_label)
                     elif args.command == "import-dump":
-                        import_dump(catalog, args.dump, args.scope, args.limit)
+                        import_dump(catalog, args.dump, args.scope, args.limit,
+                                    require_label=args.require_label)
                     elif args.command == "download":
                         width = args.width if args.width is not None else catalog.get("image_width", 960)
                         download(catalog, network, width=width, workers=args.workers, limit=args.limit,

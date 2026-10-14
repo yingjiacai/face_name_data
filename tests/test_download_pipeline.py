@@ -487,12 +487,29 @@ class LimiterTests(unittest.TestCase):
             limiter.wait("image")
         self.assertEqual(delays, [1, 17])
 
-    def test_concurrent_media_connections_share_one_byte_budget(self):
+    def test_concurrent_media_connections_share_rolling_ten_second_budget(self):
         delays = []
-        limiter = p18.BandwidthLimiter(8, clock=lambda: 100, sleep=delays.append)
+        clock = [100.0]
+        clock_lock = threading.Lock()
+
+        def now():
+            with clock_lock:
+                return clock[0]
+
+        def sleep(delay):
+            with clock_lock:
+                delays.append(delay)
+                clock[0] += delay
+
+        # 8 Mbps permits 10,000,000 bytes in any rolling ten-second window.
+        limiter = p18.BandwidthLimiter(8, clock=now, sleep=sleep)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(limiter.consume, [500_000, 500_000]))
-        self.assertEqual(sorted(delays), [0.5, 1.0])
+            waits = list(pool.map(limiter.consume, [500_000, 500_000]))
+        self.assertEqual(waits, [0.0, 0.0])
+        self.assertEqual(delays, [])
+        self.assertEqual(limiter.consume(9_000_000), 0.0)
+        self.assertEqual(limiter.consume(1), 10.0)
+        self.assertEqual(delays, [10.0])
 
 
 if __name__ == "__main__":

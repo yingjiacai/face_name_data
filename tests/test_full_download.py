@@ -31,8 +31,23 @@ class FullDownloadTests(unittest.TestCase):
         fixtures = []
         for number in range(1, 206):
             fixtures.append({"id": f"Q{number}", "labels": {"en": {"value": f"Name {number}"}},
-                             "claims": {"P18": [{"rank": "normal", "mainsnak": {
-                                 "snaktype": "value", "datavalue": {"value": f"Image {number}.png"}}}]}})
+                             "claims": {
+                                 "P31": [{"rank": "normal", "mainsnak": {
+                                     "snaktype": "value", "datavalue": {"value": {"id": "Q5"}}}}],
+                                 "P18": [{"rank": "normal", "mainsnak": {
+                                     "snaktype": "value", "datavalue": {"value": f"Image {number}.png"}}}]}})
+        for number in range(206, 211):
+            fixtures.append({"id": f"Q{number}", "labels": {"en": {"value": f"Place {number}"}},
+                             "claims": {
+                                 "P31": [{"rank": "normal", "mainsnak": {
+                                     "snaktype": "value", "datavalue": {"value": {"id": "Q515"}}}}],
+                                 "P18": [{"rank": "normal", "mainsnak": {
+                                     "snaktype": "value", "datavalue": {"value": f"Place {number}.png"}}}]}})
+        fixtures.append({"id": "Q211", "labels": {}, "claims": {
+            "P31": [{"rank": "normal", "mainsnak": {
+                "snaktype": "value", "datavalue": {"value": {"id": "Q5"}}}}],
+            "P18": [{"rank": "normal", "mainsnak": {
+                "snaktype": "value", "datavalue": {"value": "Unnamed.png"}}}]}})
         payload = gzip.compress(("[\n" + ",\n".join(json.dumps(e) for e in fixtures) + "\n]\n").encode())
         self.dump = self.root / "fixture.gz"
         self.dump.write_bytes(payload)
@@ -109,11 +124,13 @@ sys.exit(p18.main(sys.argv[2:]))
     def test_full_pipeline_exceeds_200_and_resumes_without_network(self):
         result = self.run_full()
         self.assertEqual(result.returncode, 0, result.stderr)
-        summary = json.loads((self.root / "data/p18-all/summary.json").read_text())
+        summary = json.loads((self.root / "data/p18-humans/summary.json").read_text())
         self.assertEqual(summary["entities"], 205)
         self.assertEqual(summary["file_status"], {"downloaded": 205})
         self.assertEqual(summary["image_width"], 500)
         self.assertTrue(summary["dump_progress"]["complete"])
+        self.assertEqual(summary["catalog_source"]["scope"], "humans")
+        self.assertTrue(summary["catalog_source"]["require_label"])
         fetches = (self.root / "fetches.log").read_text()
         requests = (self.root / "requests.log").read_text()
         result = self.run_full()
@@ -126,12 +143,12 @@ sys.exit(p18.main(sys.argv[2:]))
         result = self.run_full()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("checksum mismatch", result.stderr)
-        self.assertFalse((self.root / "data/p18-all/state.sqlite3").exists())
+        self.assertFalse((self.root / "data/p18-humans/state.sqlite3").exists())
         self.assertTrue((self.root / "downloads/wikidata-20261005-all.json.gz.part").exists())
         self.assertFalse((self.root / "downloads/wikidata-20261005-all.json.gz").exists())
 
     def test_sample_directory_is_detected_before_large_download(self):
-        output = self.root / "data/p18-all"
+        output = self.root / "data/p18-humans"
         output.mkdir(parents=True)
         with sqlite3.connect(output / "state.sqlite3") as db:
             db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")

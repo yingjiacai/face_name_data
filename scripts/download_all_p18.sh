@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Google Cloud / Linux: complete Wikidata snapshot -> every P18 pair -> images.
+# Google Cloud / Linux: complete Wikidata snapshot -> named humans with P18 -> images.
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,9 +9,9 @@ if [[ ${1:-} == --help || $# -gt 1 ]]; then
     cat <<'HELP'
 Usage: bash scripts/download_all_p18.sh [OUTPUT_DIRECTORY]
 
-Downloads the dated official JSON dump, verifies it, imports every P18 entity,
-downloads all associated images, and exports the results. There is no item limit.
-Repeat the same command to resume. Default output: data/p18-all.
+Downloads the dated official JSON dump, verifies it, imports named human
+entities with P18, downloads their images, and exports the results. There is no
+item limit. Repeat the same command to resume. Default output: data/p18-humans.
 
 Environment:
   P18_USER_AGENT       Existing downloader User-Agent (required)
@@ -24,7 +24,7 @@ HELP
 fi
 
 : "${P18_USER_AGENT:?Set P18_USER_AGENT to the User-Agent used by download_p18.py}"
-output_dir="${1:-data/p18-all}"
+output_dir="${1:-data/p18-humans}"
 dump_date="${P18_DUMP_DATE:-20261005}"
 compression="${P18_DUMP_COMPRESSION:-gz}"
 image_width="${P18_IMAGE_WIDTH:-500}"
@@ -45,7 +45,7 @@ mkdir -p -- "$output_dir" downloads
 exec 9>"$output_dir/.all.lock"
 flock -n 9 || { printf '%s\n' 'A full run already uses this output directory.' >&2; exit 1; }
 
-# Catch accidental reuse of a 200-item sample before downloading the large dump.
+# Catch accidental reuse of an incompatible catalog before downloading the dump.
 "$python_bin" - "$output_dir" <<'PY'
 import json
 from pathlib import Path
@@ -56,8 +56,13 @@ path = Path(sys.argv[1]).resolve() / 'state.sqlite3'
 if path.exists():
     with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as db:
         row = db.execute("SELECT value FROM meta WHERE key='catalog_source'").fetchone()
-    if row and json.loads(row[0]).get('kind') == 'online_sample':
-        raise SystemExit('Use a full-data output directory, such as data/p18-all; this directory contains an online sample.')
+    if row:
+        source = json.loads(row[0])
+        if source.get('kind') == 'online_sample':
+            raise SystemExit('Use a full human-data output directory; this directory contains an online sample.')
+        if (source.get('kind') != 'dump' or source.get('scope') != 'humans'
+                or not source.get('require_label')):
+            raise SystemExit('Use a new human-only output directory, such as data/p18-humans; this catalog has different selection rules.')
 PY
 
 dump_name="wikidata-${dump_date}-all.json.${compression}"
@@ -120,11 +125,11 @@ print(f'Complete dump verified: {target}', flush=True)
 PY
 flock -u 8
 
-printf '[2/4] Importing every entity with P18\n'
+printf '[2/4] Importing named human entities with P18\n'
 "$python_bin" scripts/download_p18.py import-dump \
-    --dump "$dump_path" --output "$output_dir" --scope all
+    --dump "$dump_path" --output "$output_dir" --scope humans --require-label
 
-printf '[3/4] Downloading all catalog images at width %s\n' "$image_width"
+printf '[3/4] Downloading human catalog images at width %s\n' "$image_width"
 download_status=0
 "$python_bin" scripts/download_p18.py download \
     --output "$output_dir" --width "$image_width" --retry-failed || download_status=$?
