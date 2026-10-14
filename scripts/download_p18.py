@@ -346,6 +346,8 @@ class Network:
             raise ValueError("Provide --user-agent or P18_USER_AGENT with application name and contact.")
         self.client = client or httpx.Client(headers={"User-Agent": user_agent},
                                              timeout=httpx.Timeout(90, connect=20),
+                                             limits=httpx.Limits(max_connections=8, max_keepalive_connections=8,
+                                                                 keepalive_expiry=60),
                                              follow_redirects=True)
         self.cancel = threading.Event()
         self.limiter = limiter or RateLimiter(cancel=self.cancel)
@@ -378,7 +380,11 @@ class Network:
     def json(self, url, params):
         def operation():
             started = time.monotonic()
-            response = self.client.get(url, params=params)
+            # Long Unicode filenames can make a 50-title GET exceed proxy limits.
+            if len(str(httpx.QueryParams(params))) > 6000:
+                response = self.client.post(url, data=params)
+            else:
+                response = self.client.get(url, params=params)
             if time.monotonic() - started > 1:
                 self.limiter.pause("api", 5)
             self.check_response(response)
@@ -484,13 +490,16 @@ def sample(catalog, network, limit=200, qids=None, scope="all"):
     catalog.db.commit()
 
 
-def resolve_files(network, rows, width):
+def resolve_files(network, rows, width, full_metadata=False):
     params = {"action": "query", "format": "json", "formatversion": 2,
               "titles": "|".join("File:" + row["filename"] for row in rows),
               "redirects": 1, "prop": "imageinfo", "iilimit": 1,
-              "iiprop": "url|size|mime|thumbmime|sha1|timestamp|extmetadata",
-              "iiextmetadatafilter": "Artist|Credit|LicenseShortName|LicenseUrl|UsageTerms|AttributionRequired|Copyrighted|ImageDescription",
-              "iiextmetadatalanguage": "en", "maxlag": 5}
+              "iiprop": "url|size|mime|thumbmime|sha1|timestamp", "maxlag": 5}
+    if full_metadata:
+        params.update(
+            iiprop=params["iiprop"] + "|extmetadata",
+            iiextmetadatafilter="Artist|Credit|LicenseShortName|LicenseUrl|UsageTerms|AttributionRequired|Copyrighted|ImageDescription",
+            iiextmetadatalanguage="en")
     if width:
         params["iiurlwidth"] = width
     data = network.json(COMMONS_API, params)
@@ -514,7 +523,8 @@ def resolve_files(network, rows, width):
             continue
         info = dict(infos[0])
         info.update({"commons_title": title, "commons_page_id": page.get("pageid"),
-                     "resolved_at": now(), "requested_width": width})
+                     "resolved_at": now(), "requested_width": width,
+                     "metadata_profile": "full" if full_metadata else "basic"})
         if width:
             image_url = info.get("thumburl")
             if not image_url and info.get("width", 0) and info["width"] <= width and info.get("mime") != "image/svg+xml":
@@ -587,6 +597,11 @@ class Staging:
         else:
             self.sizes.pop(file_id, None)
 
+    def fetched(self, file_id, size):
+        """Completed downloads need their actual bytes, not a maximum-size slot."""
+        self.sizes[file_id] = size
+        self.reserved.discard(file_id)
+
     def fetch(self, network, row):
         file_id, url = row["file_id"], row["info"]["download_url"]
         started = time.monotonic()
@@ -651,10 +666,12 @@ class DownloadProgress:
         self.processed = self.failures = self.stored_bytes = 0
         self.fetch_seconds = self.store_seconds = 0.0
         self.fetched = self.stored = self.cache_hits = 0
+        self.metadata_seconds = self.metadata_idle_seconds = 0.0
+        self.metadata_batches = self.metadata_files = 0
         self.last_at = time.monotonic()
         self.samples = deque([(self.last_at, 0, 0)])
 
-    def report(self, staging, active, force=False):
+    def report(self, staging, active, force=False, *, fetching=0, storing=0, ready=0):
         current = time.monotonic()
         if not force and current - self.last_at < self.interval:
             return
@@ -668,10 +685,15 @@ class DownloadProgress:
         eta = f"{remaining / rate / 3600:.1f}h" if rate else "unknown"
         LOG.info("This run: %d processed, %d failed | %.2f files/s | %.2f MiB/s stored | "
                  "remaining ~%d | ETA %s | avg fetch %.2fs, store %.2fs | "
+                 "metadata %.2fs/batch, %.1f files/batch, link wait %.1fs | "
+                 "%d fetching, %d storing, %d ready | "
                  "%d staged reused | %d in flight | staging reserved %.1f/%.1f MiB",
                  self.processed, self.failures, rate, (self.stored_bytes - size) / elapsed / 1024**2,
                  remaining, eta, self.fetch_seconds / max(1, self.fetched),
-                 self.store_seconds / max(1, self.stored), self.cache_hits, active,
+                 self.store_seconds / max(1, self.stored),
+                 self.metadata_seconds / max(1, self.metadata_batches),
+                 self.metadata_files / max(1, self.metadata_batches), self.metadata_idle_seconds,
+                 fetching, storing, ready, self.cache_hits, active,
                  staging.used / 1024**2, staging.capacity / 1024**2)
         self.last_at = current
 
@@ -679,11 +701,14 @@ class DownloadProgress:
 def download(catalog, network, *, width=960, workers=2, limit=None,
              retry_failed=False, max_bytes=20 * 1024**2, max_failures=10,
              upload_workers=4, staging_bytes=1024**3, skip_existing_check=False,
-             log_interval=15):
+             log_interval=15, metadata_batch_size=50, metadata_prefetch=200,
+             full_metadata=False):
     if workers not in (1, 2):
         raise ValueError("--workers must be 1 or 2 (Wikimedia media concurrency)")
     if upload_workers < 1 or staging_bytes < max_bytes:
         raise ValueError("Upload workers must be positive; --staging-mib must cover --max-image-mib")
+    if not 1 <= metadata_batch_size <= 50 or metadata_prefetch < 1:
+        raise ValueError("Metadata batch size must be 1..50; prefetch must be positive")
     catalog.bind("image_width", width)
     catalog.db.commit()
     network.cancel.clear()
@@ -695,10 +720,14 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
     consecutive = selected = 0
     exhausted = False
     fatal = None
-    # Every in-flight image reserves its maximum possible size before fetching.
-    window = min(32, max(1, staging_bytes // max_bytes))
+    # Link lookahead consumes no image disk space. Storage concurrency must not
+    # be capped at 32 when an operator chooses 32 or 64 upload workers.
+    window = max(32, workers + upload_workers * 2)
+    batch_size = min(metadata_batch_size, metadata_prefetch, 5 if full_metadata else 50)
     LOG.info("Download pipeline: %d media connections, %d storage workers, %d-file window, "
-             "%.1f Mbps media cap; local staging: %s", workers, upload_workers, window,
+             "%d metadata/batch, %d links prefetched (%s), %.1f Mbps media cap; local staging: %s",
+             workers, upload_workers, window, batch_size, metadata_prefetch,
+             "full" if full_metadata else "basic",
              network.bandwidth.bytes_per_second * 8 / 1_000_000, staging.root)
 
     def candidates():
@@ -732,7 +761,7 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
 
     rows = iter(candidates())
 
-    def fail(row, exc):
+    def fail(row, exc, *, systemic=True):
         nonlocal consecutive
         if isinstance(exc, OSError) and exc.errno in (28, 13, 30):
             raise exc
@@ -743,9 +772,14 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
         catalog.db.commit()
         progress.processed += 1
         progress.failures += 1
-        consecutive += 1
-        if consecutive >= max_failures and fatal is None:
+        consecutive = consecutive + 1 if systemic else consecutive
+        if systemic and consecutive >= max_failures and fatal is None:
             raise ValueError(f"Stopped after {consecutive} consecutive failures; inspect connectivity/storage and retry.")
+
+    def metadata_batch(batch):
+        started = time.monotonic()
+        result = resolve_files(network, batch, width, full_metadata)
+        return result, time.monotonic() - started
 
     with ThreadPoolExecutor(max_workers=1) as metadata_pool, \
             ThreadPoolExecutor(max_workers=workers) as image_pool, \
@@ -765,17 +799,39 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                         if kind == "metadata":
                             raise  # A failed API batch remains pending.
                         staging.release(job["file_id"])
-                        fail(job, exc)
+                        unavailable = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (404, 410)
+                        bad_image = kind == "fetch" and isinstance(
+                            exc, (ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning))
+                        # Pillow reports corrupt/unsupported files as OSError,
+                        # whereas actual storage errors carry an errno.
+                        bad_image = bad_image or (kind == "fetch" and isinstance(exc, OSError) and exc.errno is None)
+                        fail(job, exc, systemic=not (unavailable or bad_image))
                         continue
                     if kind == "metadata":
+                        result, seconds = result
+                        progress.metadata_seconds += seconds
+                        progress.metadata_batches += 1
+                        progress.metadata_files += len(job)
                         for row in job:
-                            row["info"] = result[row["file_id"]]
+                            info = result[row["file_id"]]
+                            previous = row.pop("previous_info", None)
+                            if previous and previous.get("extmetadata") and not info.get("extmetadata"):
+                                # Keep the earlier attribution snapshot with its
+                                # original resolution time, without requesting it again.
+                                info["previous_extmetadata"] = {
+                                    "resolved_at": previous.get("resolved_at"),
+                                    "sha1": previous.get("sha1"),
+                                    "value": previous["extmetadata"]}
+                            elif previous and previous.get("previous_extmetadata"):
+                                info["previous_extmetadata"] = previous["previous_extmetadata"]
+                            row["info"] = info
                             catalog.db.execute("UPDATE files SET info=? WHERE file_id=?",
                                                (encode(row["info"]), row["file_id"]))
                         catalog.db.commit()
                         if fatal is None:
                             ready.extend(job)
                     elif kind == "fetch":
+                        staging.fetched(job["file_id"], result["nbytes"])
                         progress.fetch_seconds += result["fetch_seconds"]
                         progress.fetched += 1
                         progress.cache_hits += int(result["cache_hit"])
@@ -800,13 +856,14 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
 
                 if fatal is None:
                     fetching = sum(kind == "fetch" for kind, _ in futures.values())
+                    storing = sum(kind == "store" for kind, _ in futures.values())
                     for _ in range(len(ready)):
                         row = ready[0]
                         if row["info"].get("error"):
                             ready.popleft()
                             catalog.db.execute("UPDATE files SET status='pending',attempts=attempts+1 WHERE file_id=?", (row["file_id"],))
-                            fail(row, ValueError(row["info"]["error"]))
-                        elif fetching < workers and staging.reserve(row["file_id"]):
+                            fail(row, ValueError(row["info"]["error"]), systemic=False)
+                        elif fetching < workers and fetching + storing < window and staging.reserve(row["file_id"]):
                             ready.popleft()
                             # A previously completed but missing/truncated file must
                             # stop being "downloaded" before its key is overwritten.
@@ -818,10 +875,10 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                         else:
                             ready.rotate(-1)
                     metadata_active = any(kind == "metadata" for kind, _ in futures.values())
-                    free = window - len(ready) - len(futures)
-                    if not exhausted and not metadata_active and free >= min(5, window):
+                    free = metadata_prefetch - len(ready)
+                    if not exhausted and not metadata_active and free >= batch_size:
                         batch = []
-                        for _ in range(min(5, free)):
+                        for _ in range(min(batch_size, free)):
                             if limit is not None and selected >= limit:
                                 exhausted = True
                                 break
@@ -831,14 +888,18 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                                 break
                             selected += 1
                             cached = row["info"]
-                            row["info"] = json.loads(cached) if cached and (
+                            row["previous_info"] = json.loads(cached) if cached else None
+                            row["info"] = row["previous_info"] if cached and (
                                 row["status"] != "failed" or row["file_id"] in staging.sizes) else None
+                            if full_metadata and row["info"] and "extmetadata" not in row["info"] and row["file_id"] not in staging.sizes:
+                                row["info"] = None
                             if row["info"]:
+                                row.pop("previous_info", None)
                                 ready.append(row)
                             else:
                                 batch.append(row)
                         if batch:
-                            futures[metadata_pool.submit(resolve_files, network, batch, width)] = ("metadata", batch)
+                            futures[metadata_pool.submit(metadata_batch, batch)] = ("metadata", batch)
                         # Fill download slots immediately after reading cached metadata.
                         continue
                     if not futures and ready:
@@ -846,9 +907,17 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                                          "or a larger --staging-mib. No staged images were discarded.")
                 if not futures and (fatal is not None or exhausted):
                     break
-                progress.report(staging, len(futures))
+                fetching = sum(kind == "fetch" for kind, _ in futures.values())
+                storing = sum(kind == "store" for kind, _ in futures.values())
+                progress.report(staging, len(futures), fetching=fetching, storing=storing, ready=len(ready))
                 if futures:
+                    waiting_for_links = (not ready and fetching < workers and fetching + storing < window
+                                         and staging.used + max_bytes <= staging.capacity and any(
+                                             kind == "metadata" for kind, _ in futures.values()))
+                    waited_at = time.monotonic()
                     wait(futures, timeout=min(1, log_interval), return_when=FIRST_COMPLETED)
+                    if waiting_for_links:
+                        progress.metadata_idle_seconds += time.monotonic() - waited_at
             except BaseException as exc:
                 if fatal is not None:
                     if isinstance(exc, KeyboardInterrupt):
@@ -957,6 +1026,12 @@ def parser():
     cmd.add_argument("--width", type=int, default=None, help="Thumbnail width, default 960; 0 requests originals")
     cmd.add_argument("--workers", type=positive, default=2, help="Wikimedia image connections: 1 or 2 (default 2)")
     cmd.add_argument("--upload-workers", type=positive, default=4, help="Concurrent writes to image storage (default 4)")
+    cmd.add_argument("--metadata-batch-size", type=positive, default=50,
+                     help="Files per Commons lookup, at most 50 (default 50)")
+    cmd.add_argument("--metadata-prefetch", type=positive, default=200,
+                     help="Maximum queued image links, separate from staged bytes (default 200)")
+    cmd.add_argument("--full-metadata", action="store_true",
+                     help="Also request costly attribution/description fields; batches capped at 5")
     cmd.add_argument("--bandwidth-mbps", type=positive_float, default=25, help="Shared media bandwidth cap, at most 25 Mbps")
     cmd.add_argument("--staging-mib", type=positive, default=1024, help="Local staged image budget in MiB (default 1024)")
     cmd.add_argument("--skip-existing-check", action="store_true",
@@ -992,6 +1067,8 @@ def main(argv=None):
                 raise ValueError("--bandwidth-mbps must be at most 25")
             if args.staging_mib < args.max_image_mib:
                 raise ValueError("--staging-mib must cover --max-image-mib")
+            if args.metadata_batch_size > 50:
+                raise ValueError("--metadata-batch-size must be at most 50")
             logging.getLogger("httpx").setLevel(logging.INFO if args.verbose else logging.WARNING)
         if args.command in {"status", "export", "verify", "download"} and not (args.output / "state.sqlite3").exists():
             raise ValueError("No catalog exists here. Run sample or import-dump first.")
@@ -1020,7 +1097,8 @@ def main(argv=None):
                                  retry_failed=args.retry_failed, max_bytes=args.max_image_mib * 1024**2,
                                  max_failures=args.max_consecutive_failures, upload_workers=args.upload_workers,
                                  staging_bytes=args.staging_mib * 1024**2, skip_existing_check=args.skip_existing_check,
-                                 log_interval=args.log_interval)
+                                 log_interval=args.log_interval, metadata_batch_size=args.metadata_batch_size,
+                                 metadata_prefetch=args.metadata_prefetch, full_metadata=args.full_metadata)
                     elif args.command == "export":
                         export(catalog)
                     elif args.command == "verify":

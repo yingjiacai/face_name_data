@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import errno
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -80,10 +81,92 @@ class PipelineTests(unittest.TestCase):
                 with lock:
                     active -= 1
 
-        self.assertEqual(p18.download(self.catalog, self.network(handler)), (12, 0))
+        self.assertEqual(p18.download(self.catalog, self.network(handler), metadata_batch_size=5), (12, 0))
         self.assertEqual(peak, 2)
         self.assertEqual(batches, [5, 5, 2])
         self.assertEqual(p18.verify(self.catalog)["verified"], 12)
+
+    def test_lightweight_batches_prefetch_200_links_while_upload_waits(self):
+        self.add(220)
+        prefetched = threading.Event()
+        batches = []
+        original = p18.store_image
+
+        def handler(request):
+            if request.url.host == "commons.wikimedia.org":
+                self.assertNotIn("extmetadata", request.url.params["iiprop"])
+                self.assertNotIn("iiextmetadatafilter", request.url.params)
+                batches.append(len(request.url.params["titles"].split("|")))
+                if sum(batches) >= 200:
+                    prefetched.set()
+            return commons(request)
+
+        def store(*args):
+            self.assertTrue(prefetched.wait(5), "Link lookahead was limited by the upload queue")
+            return original(*args)
+
+        with mock.patch.object(p18, "store_image", store):
+            self.assertEqual(p18.download(self.catalog, self.network(handler), upload_workers=1), (220, 0))
+        self.assertEqual(batches, [50, 50, 50, 50, 20])
+        self.assertEqual(p18.verify(self.catalog)["verified"], 220)
+
+    def test_full_metadata_remains_opt_in_and_uses_small_batches(self):
+        self.add(12)
+        batches = []
+
+        def handler(request):
+            if request.url.host == "commons.wikimedia.org":
+                self.assertIn("extmetadata", request.url.params["iiprop"])
+                batches.append(len(request.url.params["titles"].split("|")))
+            return commons(request)
+
+        self.assertEqual(p18.download(self.catalog, self.network(handler), full_metadata=True), (12, 0))
+        self.assertEqual(batches, [5, 5, 2])
+
+    def test_retry_preserves_previous_attribution_without_requesting_it_again(self):
+        self.add(1)
+        previous = {"error": "thumbnail_unavailable", "resolved_at": "earlier-snapshot",
+                    "sha1": "old-source-hash", "extmetadata": {"Artist": {"value": "Original artist"}}}
+        self.catalog.db.execute("UPDATE files SET status='failed',info=?", (p18.encode(previous),))
+        self.catalog.db.commit()
+        self.assertEqual(p18.download(self.catalog, self.network(), retry_failed=True), (1, 0))
+        p18.export(self.catalog)
+        record = json.loads((self.catalog.root / "pairs.jsonl").read_text())
+        self.assertEqual(record["source"]["previous_extmetadata"]["value"], previous["extmetadata"])
+        self.assertEqual(record["source"]["previous_extmetadata"]["resolved_at"], "earlier-snapshot")
+        self.assertEqual(record["source"]["metadata_profile"], "basic")
+
+    def test_more_than_32_uploads_can_run_without_reserving_maximum_size_each(self):
+        self.add(40)
+        all_started = threading.Event()
+        lock = threading.Lock()
+        active = peak = 0
+        original_store, original_reserve = p18.store_image, p18.Staging.reserve
+
+        def reserve(staging, file_id):
+            allowed = original_reserve(staging, file_id)
+            self.assertLessEqual(staging.used, 2 * 1024**2)
+            return allowed
+
+        def store(*args):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 40:
+                    all_started.set()
+            try:
+                self.assertTrue(all_started.wait(10), "Upload concurrency was capped at 32 or maximum-size slots")
+                return original_store(*args)
+            finally:
+                with lock:
+                    active -= 1
+
+        with mock.patch.object(p18.Staging, "reserve", reserve), mock.patch.object(p18, "store_image", store):
+            self.assertEqual(p18.download(self.catalog, self.network(), upload_workers=40,
+                                          max_bytes=1024**2, staging_bytes=2 * 1024**2), (40, 0))
+        self.assertEqual(peak, 40)
+        self.assertEqual(p18.verify(self.catalog)["verified"], 40)
 
     def test_storage_upload_does_not_occupy_media_connections(self):
         self.add(12)
@@ -138,9 +221,6 @@ class PipelineTests(unittest.TestCase):
 
         def slow_store(*args):
             self.assertTrue(second.wait(5))
-            with lock:
-                if not self.catalog.root.joinpath("images").exists():
-                    self.assertEqual(calls, 2)
             return original_store(*args)
 
         with mock.patch.object(p18.Staging, "reserve", reserve), mock.patch.object(p18, "store_image", slow_store):
@@ -232,11 +312,53 @@ class PipelineTests(unittest.TestCase):
             return commons(request)
 
         with self.assertRaisesRegex(ValueError, "fixture_error"):
-            p18.download(self.catalog, self.network(handler))
+            p18.download(self.catalog, self.network(handler), metadata_batch_size=5)
         self.assertNotIn("failed", self.catalog.summary()["file_status"])
         self.reopen()
         p18.download(self.catalog, self.network())
         self.assertEqual(p18.verify(self.catalog)["verified"], 12)
+
+    def test_missing_files_do_not_stop_the_rest_of_the_catalog(self):
+        self.add(14)
+
+        def handler(request):
+            response = commons(request)
+            if request.url.host == "commons.wikimedia.org":
+                data = response.json()
+                for page in data["query"]["pages"]:
+                    if page["title"] != "File:Image 14.jpg":
+                        page.pop("imageinfo")
+                return httpx.Response(200, json=data)
+            return response
+
+        self.assertEqual(p18.download(self.catalog, self.network(handler), max_failures=1), (14, 13))
+        self.assertEqual(self.catalog.summary()["file_status"], {"downloaded": 1, "failed": 13})
+
+    def test_bad_images_and_http_404_do_not_count_as_systemic_failures(self):
+        self.add(12)
+        calls = 0
+
+        def handler(request):
+            nonlocal calls
+            if request.url.host == "commons.wikimedia.org":
+                return commons(request)
+            calls += 1
+            return httpx.Response(404) if calls % 2 else httpx.Response(200, content=b"not an image")
+
+        self.assertEqual(p18.download(self.catalog, self.network(handler), max_failures=1), (12, 12))
+        self.assertEqual(self.catalog.summary()["file_status"], {"failed": 12})
+
+    def test_repeated_network_failures_still_stop_new_work(self):
+        self.add(12)
+
+        def handler(request):
+            if request.url.host == "commons.wikimedia.org":
+                return commons(request)
+            raise httpx.ConnectError("network offline", request=request)
+
+        with self.assertRaisesRegex(ValueError, "consecutive failures"):
+            p18.download(self.catalog, self.network(handler), max_failures=1)
+        self.assertGreaterEqual(self.catalog.summary()["file_status"].get("failed", 0), 1)
 
     def test_fast_resume_uses_db_and_explicit_verify_can_requeue(self):
         self.add(1)

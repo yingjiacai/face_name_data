@@ -205,6 +205,23 @@ class Tests(unittest.TestCase):
         self.assertIn("thumbnail_unavailable", result["a"]["error"])
         self.assertIsNone(result["a"]["download_url"])
 
+    def test_long_unicode_title_batch_uses_post_without_dropping_files(self):
+        rows = [{"filename": "测试人物肖像" * 8 + f" {n}.jpg", "file_id": str(n)} for n in range(50)]
+
+        def handler(request):
+            self.assertEqual(request.method, "POST")
+            params = httpx.QueryParams(request.content.decode())
+            titles = params["titles"].split("|")
+            self.assertEqual(len(titles), 50)
+            return httpx.Response(200, json={"query": {"pages": [
+                {"title": title, "imageinfo": [{"url": "https://upload.wikimedia.org/original.jpg",
+                  "thumburl": "https://thumb.wikimedia.org/thumb.jpg", "width": 1000, "mime": "image/jpeg"}]}
+                for title in titles]}})
+
+        result = p18.resolve_files(self.network(handler), rows, 500)
+        self.assertEqual(set(result), {str(n) for n in range(50)})
+        self.assertTrue(all(info["download_url"] for info in result.values()))
+
     def test_download_resume_export_and_repair(self):
         self.add()
         self.add(entity("Q90", human=False))

@@ -33,11 +33,11 @@ python scripts/download_p18.py status --output data/p18-all
 1. `sample` 获取少量在线条目，验证网络和目录；`import-dump` 从官方完整 JSON dump 逐行提取全量清单。全量采集不依赖公开 SPARQL 服务的分页或大型查询。
 2. 默认收集 Q/P 条目的全部非弃用 P18 声明，包括 normal 和 preferred；忽略 deprecated、novalue、somevalue。保留声明 ID、rank、限定符和引用。此处“有效声明”只表示结构上有值且未弃用，不表示图像正确。
 3. 姓名优先中文、简体中文、英文，缺少时取其余可用 label；完全没有 label 时用 QID 并明确标记。保留所有语言的 labels、aliases、descriptions，及 P31 类型、P373 分类、Wikidata 版本号。
-4. 通过 Commons `imageinfo` 获取缩略图地址、原图地址、原始尺寸、作者和许可等源信息。一个实体多张 P18 全部保留；多个实体共享同一规范化文件名时，只下载一次文件。
+4. 通过 Commons `imageinfo` 批量获取缩略图地址、原图地址、来源页、尺寸、格式和原图 SHA-1 等必要信息。默认不请求开销较大的 `extmetadata`（作者、许可文本、长说明）；需要在新下载时获取这些字段可加 `--full-metadata`。一个实体多张 P18 全部保留；多个实体共享同一规范化文件名时，只下载一次文件。
 5. SQLite 保存实体、对应关系、下载状态和 dump 进度；图片先在本机 `staging/` 写 `.part`、实际解码并计算 SHA-256，再交给独立线程写入最终图片目录。只有最终写入、同步和关闭成功，SQLite 才标记为 `downloaded`，随后清除暂存。对象存储上传失败或中断时保留本地副本供下次补传。
 6. 下载阶段不做人脸检测或身份验证。所有导出记录的 `reference_verified` 都是 `false`；不得直接把下载完成当成已经确认的 GT。
 
-Python 3.10+，Linux/macOS。CPU 机器即可。元数据 API 串行预取，每批最多 5 个文件；默认 2 条图片连接与 4 个存储写入线程。图片完成后立即补入下一张，不再有固定的 0.5 秒请求间隔，也不再等待整批图片完成。图片连接共享 25 Mbps 字节限速；429、5xx、`maxlag` 仍会退避并遵守 `Retry-After`。[Wikimedia 媒体下载规则](https://wikitech.wikimedia.org/wiki/Robot_policy#Media_API_rules)要求最多 2 条媒体连接及 25 Mbps 总带宽，增加存储写入线程不会增加 Wikimedia 图片连接数。
+Python 3.10+，Linux/macOS。CPU 机器即可。元数据 API 串行预取，默认每批最多 **50 个文件、提前缓存 200 个链接**；默认 2 条图片连接与 4 个存储写入线程。只查必要字段，链接队列独立于图片暂存预算；HTTP 连接空闲保留 60 秒，减少 API 等待后重新建连。图片完成后立即补入下一张，没有固定的 0.5 秒请求间隔，也不等待整批图片完成。图片连接共享 25 Mbps 字节限速；429、5xx、`maxlag` 仍会退避并遵守 `Retry-After`。[Wikimedia 媒体下载规则](https://wikitech.wikimedia.org/wiki/Robot_policy#Media_API_rules)要求最多 2 条媒体连接及 25 Mbps 总带宽，增加存储写入线程不会增加 Wikimedia 图片连接数。
 
 ## 安装
 
@@ -124,7 +124,7 @@ python scripts/download_p18.py download \
   --output data/p18-all \
   --width 500 \
   --workers 2 \
-  --upload-workers 8 \
+  --upload-workers 32 \
   --staging-mib 1024 \
   --skip-existing-check \
   --retry-failed
@@ -136,18 +136,25 @@ python scripts/download_p18.py download \
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `--workers` | `2` | Wikimedia 图片下载连接数，只能为 1 或 2。 |
-| `--upload-workers` | `4` | 最终图片目录的并发写入数；挂载对象存储时可设为 8。 |
+| `--upload-workers` | `4` | 最终图片目录的并发写入数；对象存储示例使用 32，持续积压时可调到 64。 |
+| `--metadata-batch-size` | `50` | 每次解析的文件数量，上限 50；过长的文件名列表自动改用 POST，避免 URL 长度限制。 |
+| `--metadata-prefetch` | `200` | 提前准备的图片链接数量；链接只占少量内存，不占图片暂存额度。 |
+| `--full-metadata` | 关闭 | 解析新链接时同时取作者、许可文本和长说明；开启后每批最多 5 张。不会为已完成图片重新下载或自动补齐其元数据。 |
 | `--bandwidth-mbps` | `25` | 两条图片连接共享的总带宽上限，单位为兆比特/秒，上限 25；包含重试数据。 |
 | `--staging-mib` | `1024` | 本地暂存图片的预算，必须至少容纳一张 `--max-image-mib` 规定的最大图片。 |
 | `--skip-existing-check` | 关闭 | 直接相信 SQLite 中的 `downloaded` 状态，跳过对象存储上的逐文件存在性/大小查询。缺失或损坏的旧文件需用 `verify --repair` 发现并重新排队。 |
 | `--log-interval` | `15` | 每隔多少秒输出一条速度、剩余量和耗时统计。 |
 | `--verbose` | 关闭 | 打开逐条 HTTP 请求日志；默认仅输出进度、重试与错误。 |
 
-内存中的任务队列最多容纳 32 个文件；每次下载前按单张图片的最大允许大小预留暂存额度。写入变慢时队列自动等待，避免持续堆积。暂存预算计算包括之前失败而保留的图片，不包含少量 JSON 元数据及挂载工具自身的缓存；目录空闲空间不足仍会报错停止。若已有失败暂存占满预算，使用 `--retry-failed` 优先补传它们，或显式提高预算。
+上传队列随 `--upload-workers` 扩展，32 或 64 个上传线程都能实际运行，不再受固定 32 个任务的限制。链接队列默认最多 200 个；每次开始下载前按单张图片的最大允许大小预留空间，下载完成后改按实际字节占用暂存额度。这样许多几十 KB 的待上传小图不会各占一个 20 MiB 的预算槽位。写入变慢时仍会受到任务队列和暂存预算的约束，避免持续堆积。暂存预算计算包括之前失败而保留的图片，不包含少量 JSON 元数据及挂载工具自身的缓存；目录空闲空间不足仍会报错停止。若已有失败暂存占满预算，使用 `--retry-failed` 优先补传它们，或显式提高预算。
+
+上面的对象存储命令使用 32 个上传线程。如果日志中待上传任务持续积压，可以调到 64；如果存储平均耗时很短且没有积压，提高它不会加快源站取图。图片最终仍通过 `images` 软链接写入原对象存储位置，SQLite 和暂存留在本机。
 
 图片下载与校验只操作本地暂存，最终图片通过挂载目录直接写入最终文件名，避免远端 `.part`、校验回读和改名产生的额外操作。临时存储 I/O 错误会重试两次；写满、无权限、只读则停止。只有 SQLite 提交为 `downloaded` 后，文件才视为完成；中断可能在对象目录留下尚未完成的文件，重跑会覆盖它们。因此下游应读取 SQLite 或导出结果的成功记录，而不是直接扫描图片目录。
 
-每条进度包含 `files/s`（最近约一分钟的处理速度，含失败）、`MiB/s stored`（成功写入的字节速度）、本轮剩余任务数、`ETA`、`avg fetch`（下载和本地校验平均耗时）、`store`（最终存储平均耗时）、复用暂存数及暂存预留额度。ETA 估计的是本轮结束时间，失败文件仍需重试；不能把离线测试速度当成云端实测速度。
+每条进度包含 `files/s`（最近约一分钟的处理速度，含失败）、`MiB/s stored`（成功写入的字节速度）、本轮剩余任务数、`ETA`、`avg fetch`（下载和本地校验平均耗时）、`store`（最终存储平均耗时）、`metadata`（每批链接查询的平均耗时和文件数）、`link wait`（有下载空位与暂存空间时等待链接的累计秒数）、`fetching`、`storing`（上传中和排队中的任务数）、`ready`（已准备好的链接数）、复用暂存数及暂存额度。`ready` 长期为 0 且 `link wait` 增长说明链接供应不足；待上传任务持续增加则说明最终存储跟不上。ETA 估计的是本轮结束时间，失败文件仍需重试；不能把离线测试速度当成云端实测速度。
+
+`source.metadata_profile=basic` 表示这次只查询必要字段，作者和许可文本没有在本次请求中获取。原有详细缓存会继续复用；失败项重新解析为轻量信息时，早先的详细信息及其获取时间保存在 `source.previous_extmetadata`。需要这些字段时可沿来源页另行获取。
 
 ## 进度、重试与校验
 
@@ -166,7 +173,7 @@ python scripts/download_p18.py download --output data/p18-all
 python scripts/download_p18.py export --output data/p18-all
 ```
 
-默认恢复通过文件存在性和字节数检查；`--skip-existing-check` 可跳过这一步。同长度损坏需要 `verify` 的哈希校验才能发现。上传失败的本地暂存会在重试时校验哈希并补传，内容损坏则重新下载。连续失败达到默认 10 次时停止接收新任务；按一次 Ctrl+C 也会停止新任务，等待已经开始的存储写入退出并保留暂存，之后重复命令恢复。缩略图不可用时记录失败，不会偷偷改下大幅原图；`--width 0` 是显式请求原图，但原始 SVG 等 Pillow 无法解码的格式会失败，因此推荐默认缩略图。
+默认恢复通过文件存在性和字节数检查；`--skip-existing-check` 可跳过这一步。同长度损坏需要 `verify` 的哈希校验才能发现。上传失败的本地暂存会在重试时校验哈希并补传，内容损坏则重新下载。单个 Commons 文件缺失、HTTP 404/410、坏图、格式或大小不适用会记为失败并继续，不计入系统故障阈值；连续网络或存储故障达到默认 10 次时停止接收新任务。按一次 Ctrl+C 也会停止新任务，等待已经开始的存储写入退出并保留暂存，之后重复命令恢复。缩略图不可用时记录失败，不会偷偷改下大幅原图；`--width 0` 是显式请求原图，但原始 SVG 等 Pillow 无法解码的格式会失败，因此推荐默认缩略图。
 
 如果旧版出现 `Unexpected Commons image host: thumb.wikimedia.org`，这是缩略图域名兼容问题。[Wikimedia 已将缩略图迁到该域名](https://wikitech.wikimedia.org/wiki/Thumbor)，当前脚本支持它和原图域名 `upload.wikimedia.org`。更新脚本后，在原输出目录执行 `download --retry-failed` 即可恢复；不要删除 SQLite 或重新采集清单。比如此前使用 500 像素的小样本：
 
@@ -189,7 +196,7 @@ data/p18-all/
   summary.json            # 数量、字节数和完成情况
 ```
 
-图片路径相对于输出目录。`file_id` 是规范化 Commons 文件名的 SHA-256；`sha256` 是实际下载图像内容的 SHA-256，两者用途不同。`source.sha1` 和 `source.size` 属于 Commons 原始文件，不能拿来校验缩略图。作者与许可等字段位于 `source.extmetadata`，可能含 HTML，展示时应作为数据处理。
+图片路径相对于输出目录。`file_id` 是规范化 Commons 文件名的 SHA-256；`sha256` 是实际下载图像内容的 SHA-256，两者用途不同。`source.sha1` 和 `source.size` 属于 Commons 原始文件，不能拿来校验缩略图。请求了详细元数据时，作者与许可等字段位于 `source.extmetadata`，可能含 HTML，展示时应作为数据处理。
 
 使用图像时先筛选 `pairs.jsonl` 中 `status == "downloaded"`；同一图片可能对应多个 QID，身份标注检查、跨集合去重和训练/验证划分需要考虑这一点。Wikidata 的结构化数据许可与图片各自的许可分别保留。
 
@@ -200,6 +207,22 @@ python -m unittest discover -s tests -v
 python scripts/download_p18.py --help
 ```
 
-离线测试覆盖非人物收集、多 P18/rank、跨实体图片复用、压缩 dump 恢复与截断、Commons 规范化/重定向、限流退避、坏图与 MPO 处理、断点恢复和哈希修复；也覆盖跨批次连续下载、存储阻塞与下载分离、全局字节限速、暂存预算、上传失败及中断后的无网络补传、暂存损坏重下载、对象目录软链接和快速续传。不会启动全量下载。
+离线测试覆盖非人物收集、多 P18/rank、跨实体图片复用、压缩 dump 恢复与截断、Commons 规范化/重定向、限流退避、坏图与 MPO 处理、断点恢复和哈希修复；也覆盖 50 张轻量批次、200 个链接预取、超过 32 个并发上传、全局字节限速和实际暂存预算、上传失败及中断后的无网络补传、暂存损坏重下载、对象目录软链接、快速续传和单文件错误不停止全量任务。不会启动全量下载。
 
 实现参考：[官方 dump 格式](https://www.wikidata.org/wiki/Wikidata:Database_download)、[Commons imageinfo](https://www.mediawiki.org/wiki/API:Imageinfo)、[API 请求约定](https://www.mediawiki.org/wiki/API:Etiquette)、[公开查询服务限制](https://www.mediawiki.org/wiki/Wikidata_Query_Service/User_Manual#Query_limits)。
+
+## 2026-10-14 本机连接实测
+
+使用本机现有 curl 与 HTTPX，保留 TLS 校验，串行调用公开 API；图片最多两路、合计限速低于 25 Mbps。元数据对照来自同一份 50 个 Commons 文件名单，先用其中两个 5 张批次比较字段开销，再以整份名单测试 50 张轻量批次。这是少量样本，受到网络波动、测试顺序和 CDN 缓存影响。
+
+| 测试 | 本机结果 | 对下载器的影响 |
+| --- | --- | --- |
+| 每批 5 张，附带 `extmetadata` | 两次 HTTP 耗时 1.34 / 1.97 秒，响应约 21 / 22 KB | 默认去掉这个昂贵字段 |
+| 每批 5 张，只取必要字段 | 1.01 / 1.03 秒，响应约 8.8 / 9.9 KB | 单张返回数据减少 |
+| 每批 50 张，只取必要字段 | 1.52 / 1.51 秒，响应约 91 KB | 每次最多获取十倍数量的链接 |
+| HTTPX 空闲保留 5 秒，间隔 5.2 秒再请求 | 第二次没有复用连接，耗时 1.47 秒 | API 等待后可能反复 TLS 建连 |
+| HTTPX 空闲保留 60 秒，同样等待后再请求 | 第二次复用了连接，耗时 0.45 秒 | 连接空闲保留时间改为 60 秒 |
+| HTTP/1.1 与 HTTP/2 的图片连接复用 | 两种都能复用；本轮未见 HTTP/2 稳定胜出 | 保留现有依赖和 HTTP/1.1，通过持久连接提速 |
+| 新版实际下载 50 张缩略图 | 42.24 秒，50 成功、0 失败，50 张哈希校验通过；离线续跑处理 0 张 | 真实取图、校验和恢复已验证；不是云端吞吐预测 |
+
+本机对 `www.wikidata.org` 的两次 IPv4 请求（HTTP/1.1、HTTP/2）都在 TLS 阶段超时；Commons 元数据与图片请求成功。已导入完整清单的续传只读取本地 SQLite 并请求 Commons，不需要重新连接 Wikidata 或扫描 dump。本机无法测量云端 `/mnt/algo_data` 的性能；云端是否还有存储瓶颈应看上传任务积压、`store` 和 `link wait`。
