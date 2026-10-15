@@ -404,9 +404,10 @@ def derive_human_catalog(source, output, require_label=False, dry_run=False):
 
 
 class RetryableError(Exception):
-    def __init__(self, message, delay=0):
+    def __init__(self, message, delay=0, status_code=None):
         super().__init__(message)
         self.delay = delay
+        self.status_code = status_code
 
 
 def retry_after(value):
@@ -425,6 +426,8 @@ class RateLimiter:
     def __init__(self, api_interval=1.0, image_interval=0.0, cancel=None):
         self.intervals = {"api": api_interval, "image": image_interval}
         self.next_at = {"api": 0.0, "image": 0.0}
+        self.cooldown_until = {"api": 0.0, "image": 0.0}
+        self.rate_limits = {"api": 0, "image": 0}
         self.lock = threading.Lock()
         self.cancel = cancel or threading.Event()
 
@@ -443,6 +446,23 @@ class RateLimiter:
     def pause(self, group, delay):
         with self.lock:
             self.next_at[group] = max(self.next_at[group], time.monotonic() + delay)
+
+    def rate_limited(self, group, delay):
+        """Share Retry-After and adapt media request starts after distinct 429s."""
+        with self.lock:
+            current = time.monotonic()
+            distinct = current >= self.cooldown_until[group]
+            until = current + delay
+            self.cooldown_until[group] = max(self.cooldown_until[group], until)
+            self.next_at[group] = max(self.next_at[group], until)
+            self.rate_limits[group] += 1
+            if group == "image" and distinct:
+                # Small media files can hit a request-rate limit well below the
+                # 25 Mbps byte cap. Start at five requests/s, then converge in
+                # 0.05 s steps without double-counting two in-flight responses.
+                self.intervals[group] = min(
+                    1.0, max(0.2, self.intervals[group] + 0.05))
+            return self.intervals[group], self.rate_limits[group], distinct
 
 
 class BandwidthLimiter:
@@ -520,13 +540,23 @@ class Network:
                 if attempt == self.retries:
                     raise
                 delay = max(min(2 ** (attempt + 1), 60), getattr(exc, "delay", 0))
-                LOG.warning("Retry %d/%d in %.1fs: %s", attempt + 1, self.retries, delay, exc)
-                self.limiter.pause(group, delay)
+                if isinstance(exc, RetryableError) and exc.status_code == 429:
+                    interval, count, distinct = self.limiter.rate_limited(group, delay)
+                    detail = (f"; shared {group} request gap {interval:.3f}s, "
+                              f"429 count {count}"
+                              + ("" if distinct else " (same cooldown window)"))
+                else:
+                    self.limiter.pause(group, delay)
+                    detail = ""
+                LOG.warning("Retry %s %d/%d in %.1fs: %s%s",
+                            group, attempt + 1, self.retries, delay, exc, detail)
 
     @staticmethod
     def check_response(response):
         if response.status_code in RETRY_STATUS:
-            raise RetryableError(f"HTTP {response.status_code}", retry_after(response.headers.get("retry-after")))
+            raise RetryableError(f"HTTP {response.status_code}",
+                                 retry_after(response.headers.get("retry-after")),
+                                 status_code=response.status_code)
         response.raise_for_status()
 
     def json(self, url, params):

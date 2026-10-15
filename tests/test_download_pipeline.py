@@ -464,7 +464,7 @@ class PipelineTests(unittest.TestCase):
 
 
 class LimiterTests(unittest.TestCase):
-    def test_images_have_no_fixed_gap_but_retry_after_and_api_spacing_remain(self):
+    def test_image_429_adds_shared_gap_without_double_counting_inflight_responses(self):
         clock = [100.0]
         delays = []
         event = mock.Mock()
@@ -483,9 +483,17 @@ class LimiterTests(unittest.TestCase):
             self.assertEqual(delays, [])
             limiter.wait("api")
             limiter.wait("api")
-            limiter.pause("image", 17)
+            first = limiter.rate_limited("image", 17)
+            duplicate = limiter.rate_limited("image", 17)
             limiter.wait("image")
-        self.assertEqual(delays, [1, 17])
+            limiter.wait("image")
+            second = limiter.rate_limited("image", 11)
+            limiter.wait("image")
+            limiter.wait("image")
+        self.assertEqual(first, (0.2, 1, True))
+        self.assertEqual(duplicate, (0.2, 2, False))
+        self.assertEqual(second, (0.25, 3, True))
+        self.assertEqual([round(delay, 2) for delay in delays], [1, 17, 0.2, 11, 0.25])
 
     def test_concurrent_media_connections_share_rolling_ten_second_budget(self):
         delays = []

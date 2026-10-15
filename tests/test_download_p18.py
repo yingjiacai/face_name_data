@@ -42,12 +42,18 @@ def png_bytes():
 class FakeLimiter:
     def __init__(self):
         self.delays = []
+        self.rate_limits = {"api": 0, "image": 0}
 
     def wait(self, group):
         pass
 
     def pause(self, group, delay):
         self.delays.append((group, delay))
+
+    def rate_limited(self, group, delay):
+        self.delays.append((group, delay))
+        self.rate_limits[group] += 1
+        return 0.0, self.rate_limits[group], True
 
 
 class Tests(unittest.TestCase):
@@ -273,6 +279,25 @@ class Tests(unittest.TestCase):
         self.assertEqual(network.limiter.delays, [("api", 11.0), ("api", 17.0)])
         self.assertEqual(p18.retry_after("nonsense"), 0)
         self.assertEqual(p18.retry_after("-2"), 0)
+
+    def test_image_429_uses_shared_media_cooldown_before_retry(self):
+        calls = 0
+
+        def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(429, headers={"Retry-After": "11"})
+            return httpx.Response(200, content=png_bytes())
+
+        network = self.network(handler)
+        result = network.image(
+            "https://thumb.wikimedia.org/thumb.png", self.root / "image-429", "a" * 64,
+            20 * 1024**2)
+        self.assertEqual(result["nbytes"], len(png_bytes()))
+        self.assertEqual(calls, 2)
+        self.assertEqual(network.limiter.delays, [("image", 11.0)])
+        self.assertEqual(network.limiter.rate_limits["image"], 1)
 
     def test_normalization_redirect_and_no_big_original_fallback(self):
         def handler(request):

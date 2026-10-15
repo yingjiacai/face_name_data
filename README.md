@@ -37,7 +37,7 @@ python scripts/download_p18.py status --output data/p18-humans
 5. SQLite 保存实体、对应关系、下载状态和 dump 进度；图片先在本机 `staging/` 写 `.part`、实际解码并计算 SHA-256，再交给独立线程写入最终图片目录。只有最终写入、同步和关闭成功，SQLite 才标记为 `downloaded`，随后清除暂存。对象存储上传失败或中断时保留本地副本供下次补传。
 6. 下载阶段不做人脸检测或身份验证。所有导出记录的 `reference_verified` 都是 `false`；不得直接把下载完成当成已经确认的 GT。
 
-Python 3.10+，Linux/macOS。CPU 机器即可。元数据 API 串行预取，默认每批最多 **50 个文件、提前缓存 200 个链接**；默认 2 条图片连接与 4 个存储写入线程。只查必要字段，链接队列独立于图片暂存预算；HTTP 连接空闲保留 60 秒，减少 API 等待后重新建连。图片完成后立即补入下一张，没有固定的 0.5 秒请求间隔，也不等待整批图片完成。两条图片连接共享按滚动 10 秒窗口计算的 25 Mbps 字节预算；实际窗口未达到上限时不会再为每个小文件额外休眠。429、5xx、`maxlag` 仍会退避并遵守 `Retry-After`。[Wikimedia 媒体下载规则](https://wikitech.wikimedia.org/wiki/Robot_policy#Media_API_rules)要求最多 2 条媒体连接及 25 Mbps 总带宽，增加存储写入线程不会增加 Wikimedia 图片连接数。
+Python 3.10+，Linux/macOS。CPU 机器即可。元数据 API 串行预取，默认每批最多 **50 个文件、提前缓存 200 个链接**；默认 2 条图片连接与 4 个存储写入线程。只查必要字段，链接队列独立于图片暂存预算；HTTP 连接空闲保留 60 秒，减少 API 等待后重新建连。图片完成后立即补入下一张，也不等待整批图片完成。两条图片连接共享按滚动 10 秒窗口计算的 25 Mbps 字节预算；实际窗口未达到上限时不会再为每个小文件额外休眠。图片请求起初没有固定间隔；收到 429 后，两条连接共同遵守 `Retry-After`，并从 0.20 秒开始自适应增加共享请求间隔，避免冷却结束后立即再次触发限流。5xx 和 `maxlag` 也会退避。[Wikimedia 媒体下载规则](https://wikitech.wikimedia.org/wiki/Robot_policy#Media_API_rules)要求最多 2 条媒体连接及 25 Mbps 总带宽，增加存储写入线程不会增加 Wikimedia 图片连接数。
 
 ## 安装
 
@@ -49,7 +49,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 
 # 改成你的真实联系邮箱或公开项目/用户页；无需 API Key。
-export P18_USER_AGENT='WikidataP18Downloader/0.1 (mailto:YOUR_REAL_EMAIL)'
+export P18_USER_AGENT='WikidataP18Bot/0.1 (mailto:YOUR_REAL_EMAIL)'
 
 bash scripts/download_all_p18.sh
 ```
@@ -221,7 +221,7 @@ rm -rf -- data/p18-all
   --upload-workers 8 \
   --staging-mib 1024 \
   --skip-existing-check \
-  --user-agent "face-name-data/0.1 (mailto:yk_chai@yeah.net)"
+  --user-agent "face-name-data-bot/0.1 (mailto:yk_chai@yeah.net)"
 ```
 
 ## 对象存储与连续下载
@@ -268,6 +268,8 @@ python scripts/download_p18.py download \
 图片下载与校验只操作本地暂存，最终图片通过挂载目录直接写入最终文件名，避免远端 `.part`、校验回读和改名产生的额外操作。临时存储 I/O 错误会重试两次；写满、无权限、只读则停止。只有 SQLite 提交为 `downloaded` 后，文件才视为完成；中断可能在对象目录留下尚未完成的文件，重跑会覆盖它们。因此下游应读取 SQLite 或导出结果的成功记录，而不是直接扫描图片目录。
 
 每条进度包含 `files/s`（最近约一分钟的处理速度，含失败）、`MiB/s stored`（成功写入的字节速度）、本轮剩余任务数、`ETA`、`avg fetch`（下载和本地校验平均耗时）、`throttle`（每张图因滚动带宽窗口主动等待的平均秒数）、`store`（最终存储平均耗时）、`metadata`（每批链接查询的平均耗时和文件数）、`link wait`（有下载空位与暂存空间时等待链接的累计秒数）、`fetching`、`storing`（上传中和排队中的任务数）、`ready`（已准备好的链接数）、复用暂存数及暂存额度。`ready` 长期为 0 且 `link wait` 增长说明链接供应不足；待上传任务持续增加则说明最终存储跟不上。ETA 估计的是本轮结束时间，失败文件仍需重试；不能把离线测试速度当成云端实测速度。
+
+`Retry image 1/5 ... HTTP 429; shared image request gap 0.200s` 表示图片 CDN 要求暂缓，本轮还没有产生失败。两条图片线程会一起等待，并使用日志中的共享间隔错开后续请求；如果新的独立 429 继续出现，间隔每次增加 0.05 秒，最大 1 秒。同一冷却窗口中两条已在途请求同时返回 429，只计作一次调速。`Retry api` 则来自 Commons/Wikidata 元数据接口，不会误降图片请求速率。
 
 `source.metadata_profile=basic` 表示这次只查询必要字段，作者和许可文本没有在本次请求中获取。原有详细缓存会继续复用；失败项重新解析为轻量信息时，早先的详细信息及其获取时间保存在 `source.previous_extmetadata`。需要这些字段时可沿来源页另行获取。
 
