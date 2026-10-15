@@ -43,6 +43,8 @@ class FakeLimiter:
     def __init__(self):
         self.delays = []
         self.rate_limits = {"api": 0, "image": 0}
+        self.rate_limit_events = {"api": 0, "image": 0}
+        self.cooldown_seconds = {"api": 0.0, "image": 0.0}
 
     def wait(self, group):
         pass
@@ -53,7 +55,15 @@ class FakeLimiter:
     def rate_limited(self, group, delay):
         self.delays.append((group, delay))
         self.rate_limits[group] += 1
-        return 0.0, self.rate_limits[group], True
+        self.rate_limit_events[group] += 1
+        self.cooldown_seconds[group] += delay
+        return (0.0, self.rate_limits[group], self.rate_limit_events[group],
+                self.cooldown_seconds[group], True)
+
+    def snapshot(self, group):
+        return {"interval": 0.0, "responses": self.rate_limits[group],
+                "events": self.rate_limit_events[group],
+                "cooldown_seconds": self.cooldown_seconds[group]}
 
 
 class Tests(unittest.TestCase):

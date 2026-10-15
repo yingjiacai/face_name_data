@@ -423,11 +423,13 @@ def retry_after(value):
 
 
 class RateLimiter:
-    def __init__(self, api_interval=1.0, image_interval=0.0, cancel=None):
+    def __init__(self, api_interval=1.0, image_interval=0.1, cancel=None):
         self.intervals = {"api": api_interval, "image": image_interval}
         self.next_at = {"api": 0.0, "image": 0.0}
         self.cooldown_until = {"api": 0.0, "image": 0.0}
         self.rate_limits = {"api": 0, "image": 0}
+        self.rate_limit_events = {"api": 0, "image": 0}
+        self.cooldown_seconds = {"api": 0.0, "image": 0.0}
         self.lock = threading.Lock()
         self.cancel = cancel or threading.Event()
 
@@ -448,21 +450,26 @@ class RateLimiter:
             self.next_at[group] = max(self.next_at[group], time.monotonic() + delay)
 
     def rate_limited(self, group, delay):
-        """Share Retry-After and adapt media request starts after distinct 429s."""
+        """Share Retry-After without turning occasional 429s into a permanent cap."""
         with self.lock:
             current = time.monotonic()
             distinct = current >= self.cooldown_until[group]
             until = current + delay
+            added = max(0.0, until - max(current, self.cooldown_until[group]))
             self.cooldown_until[group] = max(self.cooldown_until[group], until)
             self.next_at[group] = max(self.next_at[group], until)
             self.rate_limits[group] += 1
-            if group == "image" and distinct:
-                # Small media files can hit a request-rate limit well below the
-                # 25 Mbps byte cap. Start at five requests/s, then converge in
-                # 0.05 s steps without double-counting two in-flight responses.
-                self.intervals[group] = min(
-                    1.0, max(0.2, self.intervals[group] + 0.05))
-            return self.intervals[group], self.rate_limits[group], distinct
+            self.rate_limit_events[group] += int(distinct)
+            self.cooldown_seconds[group] += added
+            return (self.intervals[group], self.rate_limits[group],
+                    self.rate_limit_events[group], self.cooldown_seconds[group], distinct)
+
+    def snapshot(self, group):
+        with self.lock:
+            return {"interval": self.intervals[group],
+                    "responses": self.rate_limits[group],
+                    "events": self.rate_limit_events[group],
+                    "cooldown_seconds": self.cooldown_seconds[group]}
 
 
 class BandwidthLimiter:
@@ -529,6 +536,20 @@ class Network:
     def close(self):
         self.client.close()
 
+    def rate_snapshot(self, group):
+        snapshot = getattr(self.limiter, "snapshot", None)
+        if snapshot is not None:
+            return snapshot(group)
+        # Keep lightweight injected limiters compatible with progress logging.
+        intervals = getattr(self.limiter, "intervals", {})
+        limits = getattr(self.limiter, "rate_limits", {})
+        events = getattr(self.limiter, "rate_limit_events", {})
+        cooldowns = getattr(self.limiter, "cooldown_seconds", {})
+        return {"interval": intervals.get(group, 0.0),
+                "responses": limits.get(group, 0),
+                "events": events.get(group, 0),
+                "cooldown_seconds": cooldowns.get(group, 0.0)}
+
     def run(self, group, operation):
         for attempt in range(self.retries + 1):
             if self.cancel.is_set():
@@ -541,9 +562,11 @@ class Network:
                     raise
                 delay = max(min(2 ** (attempt + 1), 60), getattr(exc, "delay", 0))
                 if isinstance(exc, RetryableError) and exc.status_code == 429:
-                    interval, count, distinct = self.limiter.rate_limited(group, delay)
-                    detail = (f"; shared {group} request gap {interval:.3f}s, "
-                              f"429 count {count}"
+                    interval, responses, events, cooldown, distinct = \
+                        self.limiter.rate_limited(group, delay)
+                    detail = (f"; shared cooldown, {group} request gap {interval:.3f}s, "
+                              f"429 responses {responses} across {events} cooldowns, "
+                              f"{cooldown:.1f}s cooldown total"
                               + ("" if distinct else " (same cooldown window)"))
                 else:
                     self.limiter.pause(group, delay)
@@ -860,7 +883,8 @@ class DownloadProgress:
         self.last_at = time.monotonic()
         self.samples = deque([(self.last_at, 0, 0)])
 
-    def report(self, staging, active, force=False, *, fetching=0, storing=0, ready=0):
+    def report(self, staging, active, force=False, *, fetching=0, storing=0, ready=0,
+               media=None):
         current = time.monotonic()
         if not force and current - self.last_at < self.interval:
             return
@@ -872,8 +896,11 @@ class DownloadProgress:
         rate = (self.processed - count) / elapsed
         remaining = max(0, self.total - self.processed)
         eta = f"{remaining / rate / 3600:.1f}h" if rate else "unknown"
+        media = media or {"interval": 0.0, "responses": 0, "events": 0,
+                          "cooldown_seconds": 0.0}
         LOG.info("This run: %d processed, %d failed | %.2f files/s | %.2f MiB/s stored | "
-                 "remaining ~%d | ETA %s | avg fetch %.2fs, throttle %.3fs, store %.2fs | "
+                 "remaining ~%d | ETA %s | avg fetch %.2fs, bandwidth wait %.3fs, store %.2fs | "
+                 "media gap %.3fs, 429 %d/%d, cooldown %.1fs | "
                  "metadata %.2fs/batch, %.1f files/batch, link wait %.1fs | "
                  "%d fetching, %d storing, %d ready | "
                  "%d staged reused | %d in flight | staging reserved %.1f/%.1f MiB",
@@ -881,6 +908,8 @@ class DownloadProgress:
                  remaining, eta, self.fetch_seconds / max(1, self.fetched),
                  self.throttle_seconds / max(1, self.fetched),
                  self.store_seconds / max(1, self.stored),
+                 media["interval"], media["responses"], media["events"],
+                 media["cooldown_seconds"],
                  self.metadata_seconds / max(1, self.metadata_batches),
                  self.metadata_files / max(1, self.metadata_batches), self.metadata_idle_seconds,
                  fetching, storing, ready, self.cache_hits, active,
@@ -915,10 +944,12 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
     window = max(32, workers + upload_workers * 2)
     batch_size = min(metadata_batch_size, metadata_prefetch, 5 if full_metadata else 50)
     LOG.info("Download pipeline: %d media connections, %d storage workers, %d-file window, "
-             "%d metadata/batch, %d links prefetched (%s), %.1f Mbps media cap; local staging: %s",
+             "%d metadata/batch, %d links prefetched (%s), %.1f Mbps media cap, "
+             "%.3fs media request gap; local staging: %s",
              workers, upload_workers, window, batch_size, metadata_prefetch,
              "full" if full_metadata else "basic",
-             network.bandwidth.bytes_per_second * 8 / 1_000_000, staging.root)
+             network.bandwidth.bytes_per_second * 8 / 1_000_000,
+             network.rate_snapshot("image")["interval"], staging.root)
 
     def candidates():
         resumed = set()
@@ -1100,7 +1131,8 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                     break
                 fetching = sum(kind == "fetch" for kind, _ in futures.values())
                 storing = sum(kind == "store" for kind, _ in futures.values())
-                progress.report(staging, len(futures), fetching=fetching, storing=storing, ready=len(ready))
+                progress.report(staging, len(futures), fetching=fetching, storing=storing,
+                                ready=len(ready), media=network.rate_snapshot("image"))
                 if futures:
                     waiting_for_links = (not ready and fetching < workers and fetching + storing < window
                                          and staging.used + max_bytes <= staging.capacity and any(
@@ -1121,7 +1153,7 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                 ready.clear()
                 for future in futures:
                     future.cancel()
-    progress.report(staging, 0, force=True)
+    progress.report(staging, 0, force=True, media=network.rate_snapshot("image"))
     if fatal is not None:
         raise fatal
     return progress.processed, progress.failures

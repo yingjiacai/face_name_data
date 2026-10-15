@@ -464,7 +464,7 @@ class PipelineTests(unittest.TestCase):
 
 
 class LimiterTests(unittest.TestCase):
-    def test_image_429_adds_shared_gap_without_double_counting_inflight_responses(self):
+    def test_image_429_shares_cooldown_without_permanently_reducing_rate(self):
         clock = [100.0]
         delays = []
         event = mock.Mock()
@@ -480,7 +480,7 @@ class LimiterTests(unittest.TestCase):
         with mock.patch.object(p18.time, "monotonic", lambda: clock[0]):
             limiter.wait("image")
             limiter.wait("image")
-            self.assertEqual(delays, [])
+            self.assertEqual([round(delay, 2) for delay in delays], [0.1])
             limiter.wait("api")
             limiter.wait("api")
             first = limiter.rate_limited("image", 17)
@@ -490,10 +490,12 @@ class LimiterTests(unittest.TestCase):
             second = limiter.rate_limited("image", 11)
             limiter.wait("image")
             limiter.wait("image")
-        self.assertEqual(first, (0.2, 1, True))
-        self.assertEqual(duplicate, (0.2, 2, False))
-        self.assertEqual(second, (0.25, 3, True))
-        self.assertEqual([round(delay, 2) for delay in delays], [1, 17, 0.2, 11, 0.25])
+        self.assertEqual(first, (0.1, 1, 1, 17.0, True))
+        self.assertEqual(duplicate, (0.1, 2, 1, 17.0, False))
+        self.assertEqual(second, (0.1, 3, 2, 28.0, True))
+        self.assertEqual(limiter.snapshot("image"), {
+            "interval": 0.1, "responses": 3, "events": 2, "cooldown_seconds": 28.0})
+        self.assertEqual([round(delay, 2) for delay in delays], [0.1, 1, 17, 0.1, 11, 0.1])
 
     def test_concurrent_media_connections_share_rolling_ten_second_budget(self):
         delays = []
