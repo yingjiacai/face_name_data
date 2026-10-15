@@ -29,7 +29,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 import warnings
 
 import httpx
@@ -423,7 +423,7 @@ def retry_after(value):
 
 
 class RateLimiter:
-    def __init__(self, api_interval=1.0, image_interval=0.1, cancel=None):
+    def __init__(self, api_interval=1.0, image_interval=0.1, cancel=None, clock=None):
         self.intervals = {"api": api_interval, "image": image_interval}
         self.next_at = {"api": 0.0, "image": 0.0}
         self.cooldown_until = {"api": 0.0, "image": 0.0}
@@ -432,32 +432,125 @@ class RateLimiter:
         self.cooldown_seconds = {"api": 0.0, "image": 0.0}
         self.lock = threading.Lock()
         self.cancel = cancel or threading.Event()
+        self.clock = clock or (lambda: time.monotonic())
+        current = self.clock()
+        self._image_buckets = {
+            "miss": {"tokens": 8, "capacity": 8, "rate": 0.95, "last": current},
+            "hit": {"tokens": 24, "capacity": 24, "rate": 2.85, "last": current},
+        }
+        self._image_tickets = {}
+        self._upload_pending = None
+        self._image_pause_generation = 0
+
+    def _image_ready(self, host, current):
+        """Project whole-token credit without changing either bucket's clock."""
+        ready = max(current, self.next_at["image"], self.cooldown_until["image"])
+        if host != "upload.wikimedia.org":
+            return ready, None
+        if self._upload_pending is not None:
+            return max(ready, current + 0.05), None
+        snapshot = {}
+        for key, bucket in self._image_buckets.items():
+            earned = math.floor(max(0.0, current - bucket["last"]) * bucket["rate"])
+            snapshot[key] = min(bucket["capacity"], bucket["tokens"] + earned)
+            if snapshot[key] < 1:
+                # Leave a small margin at floating-point token boundaries.
+                ready = max(ready, bucket["last"] +
+                            (1 - bucket["tokens"]) / bucket["rate"] + 0.000001)
+        return ready, snapshot
+
+    def reserve_image(self, url):
+        """Return an opaque request ticket, or None while media credit is unavailable."""
+        host = urlparse(url).hostname
+        with self.lock:
+            if self.cancel.is_set():
+                raise CancelledError()
+            current = self.clock()
+            ready, snapshot = self._image_ready(host, current)
+            if ready > current:
+                return None
+            ticket = {"host": host, "reserved_at": current,
+                      "pause_generation": self._image_pause_generation}
+            self._image_tickets[id(ticket)] = (ticket, snapshot)
+            if snapshot is not None:
+                self._upload_pending = id(ticket)
+            self.next_at["image"] = current + self.intervals["image"]
+            return ticket
+
+    def image_ticket_valid(self, ticket):
+        """A cooldown installed after dispatch also applies to workers not yet started."""
+        with self.lock:
+            return (id(ticket) in self._image_tickets and
+                    ticket["pause_generation"] == self._image_pause_generation)
+
+    def finish_image(self, ticket, status=None, cache=None, unused=False):
+        """Settle once at headers; unused releases a request that was never sent."""
+        with self.lock:
+            reservation = self._image_tickets.get(id(ticket))
+            if reservation is None or reservation[0] is not ticket:
+                return
+            del self._image_tickets[id(ticket)]
+            snapshot = reservation[1]
+            if snapshot is None:
+                return
+            self._upload_pending = None
+            if unused:
+                return
+            cache = (cache or "").strip().lower()
+            if status == 200 and cache == "hit-front":
+                used = ("hit",)
+            elif status == 200 and cache in ("miss", "hit-local"):
+                used = ("miss",)
+            else:
+                used = ("miss", "hit")
+            confirmed = self.clock()
+            for key in used:
+                bucket = self._image_buckets[key]
+                bucket["tokens"] = snapshot[key] - 1
+                # Headers arrive after the server's debit. Measuring from here
+                # conservatively excludes network time and discarded fractions.
+                bucket["last"] = confirmed
+
+    def image_delay(self, url):
+        """Return a nonnegative polling delay without reserving or earning credit."""
+        host = urlparse(url).hostname
+        with self.lock:
+            if self.cancel.is_set():
+                raise CancelledError()
+            current = self.clock()
+            ready, _ = self._image_ready(host, current)
+            return max(0.0, ready - current)
 
     def wait(self, group):
         while True:
             if self.cancel.is_set():
                 raise CancelledError()
             with self.lock:
-                delay = self.next_at[group] - time.monotonic()
+                current = self.clock()
+                delay = self.next_at[group] - current
                 if delay <= 0:
-                    self.next_at[group] = time.monotonic() + self.intervals[group]
+                    self.next_at[group] = current + self.intervals[group]
                     return
             if self.cancel.wait(delay):
                 raise CancelledError()
 
     def pause(self, group, delay):
         with self.lock:
-            self.next_at[group] = max(self.next_at[group], time.monotonic() + delay)
+            self.next_at[group] = max(self.next_at[group], self.clock() + delay)
+            if group == "image":
+                self._image_pause_generation += 1
 
     def rate_limited(self, group, delay):
         """Share Retry-After without turning occasional 429s into a permanent cap."""
         with self.lock:
-            current = time.monotonic()
+            current = self.clock()
             distinct = current >= self.cooldown_until[group]
             until = current + delay
             added = max(0.0, until - max(current, self.cooldown_until[group]))
             self.cooldown_until[group] = max(self.cooldown_until[group], until)
             self.next_at[group] = max(self.next_at[group], until)
+            if group == "image":
+                self._image_pause_generation += 1
             self.rate_limits[group] += 1
             self.rate_limit_events[group] += int(distinct)
             self.cooldown_seconds[group] += added
@@ -520,7 +613,7 @@ class BandwidthLimiter:
 
 
 class Network:
-    def __init__(self, user_agent, *, retries=5, client=None, limiter=None):
+    def __init__(self, user_agent, *, retries=5, client=None, limiter=None, archive_client=None):
         if not user_agent or "\n" in user_agent or "\r" in user_agent:
             raise ValueError("Provide --user-agent or P18_USER_AGENT with application name and contact.")
         self.client = client or httpx.Client(headers={"User-Agent": user_agent},
@@ -529,12 +622,32 @@ class Network:
                                                                  keepalive_expiry=60),
                                              follow_redirects=True)
         self.cancel = threading.Event()
+        self.archive_disabled = threading.Event()
+        self.archive_client = archive_client or httpx.Client(
+            headers={"User-Agent": user_agent, "Accept-Encoding": "identity"},
+            timeout=httpx.Timeout(20, connect=8),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=10,
+                               keepalive_expiry=60), follow_redirects=False)
         self.limiter = limiter or RateLimiter(cancel=self.cancel)
         self.bandwidth = BandwidthLimiter(cancel=self.cancel)
         self.retries = retries
 
     def close(self):
         self.client.close()
+        self.archive_client.close()
+
+    def reserve_image(self, url):
+        reserve = getattr(self.limiter, "reserve_image", None)
+        return reserve(url) if reserve else {}
+
+    def finish_image(self, ticket, *, status=None, cache=None, unused=False):
+        finish = getattr(self.limiter, "finish_image", None)
+        if finish is not None and ticket is not None:
+            finish(ticket, status=status, cache=cache, unused=unused)
+
+    def image_delay(self, url):
+        delay = getattr(self.limiter, "image_delay", None)
+        return delay(url) if delay else 0.0
 
     def rate_snapshot(self, group):
         snapshot = getattr(self.limiter, "snapshot", None)
@@ -550,16 +663,26 @@ class Network:
                 "events": events.get(group, 0),
                 "cooldown_seconds": cooldowns.get(group, 0.0)}
 
-    def run(self, group, operation):
+    def run(self, group, operation, *, image_url=None, ticket=None):
         for attempt in range(self.retries + 1):
             if self.cancel.is_set():
+                self.finish_image(ticket, unused=True)
                 raise CancelledError()
-            self.limiter.wait(group)
+            active_ticket = ticket if attempt == 0 else None
+            if image_url and hasattr(self.limiter, "reserve_image"):
+                if active_ticket is not None and not self.limiter.image_ticket_valid(active_ticket):
+                    self.finish_image(active_ticket, unused=True)
+                    active_ticket = None
+                while active_ticket is None:
+                    active_ticket = self.reserve_image(image_url)
+                    if active_ticket is None:
+                        if self.cancel.wait(max(0.001, min(1.0, self.image_delay(image_url)))):
+                            raise CancelledError()
+            else:
+                self.limiter.wait(group)
             try:
-                return operation()
+                return operation(active_ticket) if image_url else operation()
             except (httpx.TransportError, RetryableError) as exc:
-                if attempt == self.retries:
-                    raise
                 delay = max(min(2 ** (attempt + 1), 60), getattr(exc, "delay", 0))
                 if isinstance(exc, RetryableError) and exc.status_code == 429:
                     interval, responses, events, cooldown, distinct = \
@@ -571,8 +694,13 @@ class Network:
                 else:
                     self.limiter.pause(group, delay)
                     detail = ""
+                # Even the final failed request must cool down other workers.
+                if attempt == self.retries:
+                    raise
                 LOG.warning("Retry %s %d/%d in %.1fs: %s%s",
                             group, attempt + 1, self.retries, delay, exc, detail)
+            finally:
+                self.finish_image(active_ticket)
 
     @staticmethod
     def check_response(response):
@@ -602,51 +730,145 @@ class Network:
             return data
         return self.run("api", operation)
 
-    def image(self, url, root, file_id, max_bytes):
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname not in COMMONS_IMAGE_HOSTS:
-            raise ValueError(f"Unexpected Commons image host: {parsed.hostname}")
+    def image(self, url, root, file_id, max_bytes, *, ticket=None):
+        def operation(active_ticket):
+            with self.client.stream("GET", url, follow_redirects=False) as response:
+                # Keep an original reserved until a 429 has installed the shared cooldown.
+                if response.status_code != 429:
+                    self.finish_image(active_ticket, status=response.status_code,
+                                      cache=response.headers.get("x-cache-status"))
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ValueError("Commons redirect without Location")
+                    return {"redirect": urljoin(url, location)}
+                self.check_response(response)
+                return self._save_image(response, root, file_id, max_bytes)
+        for _ in range(7):
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.hostname not in COMMONS_IMAGE_HOSTS:
+                self.finish_image(ticket, unused=True)
+                raise ValueError(f"Unexpected Commons image host: {parsed.hostname}")
+            result = self.run("image", operation, image_url=url, ticket=ticket)
+            ticket = None
+            if "redirect" not in result:
+                return result
+            url = result["redirect"]
+        raise ValueError("Too many Commons image redirects")
+
+    @staticmethod
+    def archive_urls(info):
+        """Locate old original bytes; thumbnails and ambiguous long names stay on Commons."""
+        original = urlparse(info.get("url") or "")
+        download_url = urlparse(info.get("download_url") or "")
+        sha1, stamp = info.get("sha1") or "", info.get("timestamp") or ""
+        name = unquote(original.path.rsplit("/", 1)[-1])
+        try:
+            uploaded = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+            eligible = (original.scheme == download_url.scheme == "https"
+                        and original.hostname == download_url.hostname == "upload.wikimedia.org"
+                        and original.path == download_url.path
+                        and 0 < info.get("width", 0) <= 500 and info.get("size", 0) > 0
+                        and uploaded.year < 2018 and 0 < len(name) <= 100
+                        and "/" not in name and "\\" not in name
+                        and re.fullmatch(r"[0-9a-fA-F]{40}", sha1))
+        except (TypeError, ValueError):
+            return []
+        if not eligible:
+            return []
+        date, month = uploaded.strftime("%Y-%m-%d"), uploaded.strftime("%Y%m")
+        prefix = "Wikimediacommons" if month in {"201004", "201005", "201006"} else "wikimediacommons"
+        member = quote(uploaded.strftime("%Y/%m/%d/") + name, safe="")
+        return [f"https://archive.org/download/{prefix}-{month}/{date}.zip/{member}",
+                f"https://archive.org/download/wikimediacommons-{date}/{date}.zip/{member}"]
+
+    def archive_image(self, info, root, file_id, max_bytes):
+        """A mirror miss is a routing decision, not a failed catalog entry."""
+        started = time.monotonic()
+        try:
+            for index, url in enumerate(self.archive_urls(info)):
+                for _ in range(7):
+                    if self.cancel.is_set():
+                        raise CancelledError()
+                    if self.archive_disabled.is_set() or time.monotonic() - started > 30:
+                        return None
+                    parsed = urlparse(url)
+                    if parsed.scheme != "https" or not (
+                            parsed.hostname == "archive.org" or
+                            (parsed.hostname or "").endswith(".archive.org")):
+                        return None
+                    with self.archive_client.stream("GET", url, follow_redirects=False) as response:
+                        if response.status_code in {403, 429}:
+                            self.archive_disabled.set()
+                            return None
+                        if response.status_code in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("location")
+                            if not location:
+                                return None
+                            url = urljoin(url, location)
+                            continue
+                        if response.status_code == 404 and index == 0:
+                            break
+                        if response.status_code != 200:
+                            return None
+                        return self._save_image(response, root, file_id, max_bytes,
+                                                expected=info, deadline=started + 30)
+                else:
+                    return None
+        except (httpx.HTTPError, ValueError, Image.DecompressionBombError,
+                Image.DecompressionBombWarning):
+            return None
+        except OSError as exc:
+            # Pillow rejects corrupt data with an errno-less OSError; real disk failures propagate.
+            if exc.errno is not None:
+                raise
+        return None
+
+    def _save_image(self, response, root, file_id, max_bytes, *, expected=None, deadline=None):
         directory = root / "images" / file_id[:2]
         directory.mkdir(parents=True, exist_ok=True)
         partial = directory / f"{file_id}.part"
-
-        def operation():
-            digest = hashlib.sha256()
-            count = 0
-            throttle_seconds = 0.0
-            try:
-                with self.client.stream("GET", url) as response:
-                    self.check_response(response)
-                    if int(response.headers.get("content-length", 0)) > max_bytes:
+        digest, original_digest = hashlib.sha256(), hashlib.sha1()
+        count, throttle_seconds = 0, 0.0
+        try:
+            if int(response.headers.get("content-length", 0)) > max_bytes:
+                raise ValueError("Image exceeds --max-image-mib")
+            with partial.open("wb") as stream:
+                for block in response.iter_bytes(128 * 1024):
+                    if self.cancel.is_set():
+                        raise CancelledError()
+                    if expected is not None and (self.archive_disabled.is_set() or
+                                                 time.monotonic() > deadline):
+                        return None
+                    throttle_seconds += self.bandwidth.consume(len(block))
+                    count += len(block)
+                    if count > max_bytes:
                         raise ValueError("Image exceeds --max-image-mib")
-                    with partial.open("wb") as stream:
-                        for block in response.iter_bytes(128 * 1024):
-                            throttle_seconds += self.bandwidth.consume(len(block))
-                            count += len(block)
-                            if count > max_bytes:
-                                raise ValueError("Image exceeds --max-image-mib")
-                            stream.write(block)
-                            digest.update(block)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", Image.DecompressionBombWarning)
-                    with Image.open(partial) as image:
-                        width, height, image_format = image.width, image.height, image.format
-                        image.verify()
-                    # verify() alone does not decode JPEG pixels.
-                    with Image.open(partial) as image:
-                        image.load()
-                if image_format not in EXTENSIONS:
-                    raise ValueError(f"Unsupported raster format: {image_format}")
-                target = directory / f"{file_id}{EXTENSIONS[image_format]}"
-                os.replace(partial, target)
-                return {"path": str(target.relative_to(root)), "sha256": digest.hexdigest(),
-                        "nbytes": count, "width": width, "height": height,
-                        "throttle_seconds": throttle_seconds}
-            finally:
-                partial.unlink(missing_ok=True)
-        return self.run("image", operation)
+                    stream.write(block)
+                    digest.update(block)
+                    if expected is not None:
+                        original_digest.update(block)
+                if expected is not None and (count != expected["size"] or
+                                             original_digest.hexdigest() != expected["sha1"].lower()):
+                    return None
+                stream.flush()
+                os.fsync(stream.fileno())
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(partial) as image:
+                    width, height, image_format = image.width, image.height, image.format
+                    image.verify()
+                with Image.open(partial) as image:
+                    image.load()
+            if image_format not in EXTENSIONS:
+                raise ValueError(f"Unsupported raster format: {image_format}")
+            target = directory / f"{file_id}{EXTENSIONS[image_format]}"
+            os.replace(partial, target)
+            return {"path": str(target.relative_to(root)), "sha256": digest.hexdigest(),
+                    "nbytes": count, "width": width, "height": height,
+                    "throttle_seconds": throttle_seconds}
+        finally:
+            partial.unlink(missing_ok=True)
 
 
 def sample(catalog, network, limit=200, qids=None, scope="all", require_label=False):
@@ -812,7 +1034,14 @@ class Staging:
         self.sizes[file_id] = size
         self.reserved.discard(file_id)
 
-    def fetch(self, network, row):
+    def fetch(self, network, row, *, source="commons", ticket=None):
+        try:
+            return self._fetch(network, row, source=source, ticket=ticket)
+        finally:
+            # A staged hit (or an error before HTTP) did not spend the reserved request.
+            network.finish_image(ticket, unused=True)
+
+    def _fetch(self, network, row, *, source, ticket):
         file_id, url = row["file_id"], row["info"]["download_url"]
         started = time.monotonic()
         try:
@@ -833,7 +1062,12 @@ class Staging:
                     "throttle_seconds": 0.0, "cache_hit": True}
         except (FileNotFoundError, KeyError, TypeError, ValueError):
             self.remove_files(file_id)
-        result = network.image(url, self.root, file_id, self.max_bytes)
+        if source == "archive":
+            result = network.archive_image(row["info"], self.root, file_id, self.max_bytes)
+            if result is None:
+                return None
+        else:
+            result = network.image(url, self.root, file_id, self.max_bytes, ticket=ticket)
         result["download_url"] = url
         with atomic_text(self.manifest(file_id)) as stream:
             stream.write(encode(result))
@@ -921,9 +1155,11 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
              retry_failed=False, max_bytes=20 * 1024**2, max_failures=10,
              upload_workers=4, staging_bytes=1024**3, skip_existing_check=False,
              log_interval=15, metadata_batch_size=50, metadata_prefetch=200,
-             full_metadata=False):
+             full_metadata=False, archive_workers=10):
     if workers not in (1, 2):
         raise ValueError("--workers must be 1 or 2 (Wikimedia media concurrency)")
+    if not 0 <= archive_workers <= 10:
+        raise ValueError("--archive-workers must be between 0 and 10")
     if upload_workers < 1 or staging_bytes < max_bytes:
         raise ValueError("Upload workers must be positive; --staging-mib must cover --max-image-mib")
     if not 1 <= metadata_batch_size <= 50 or metadata_prefetch < 1:
@@ -941,12 +1177,12 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
     fatal = None
     # Link lookahead consumes no image disk space. Storage concurrency must not
     # be capped at 32 when an operator chooses 32 or 64 upload workers.
-    window = max(32, workers + upload_workers * 2)
+    window = max(32, workers + archive_workers + upload_workers * 2)
     batch_size = min(metadata_batch_size, metadata_prefetch, 5 if full_metadata else 50)
-    LOG.info("Download pipeline: %d media connections, %d storage workers, %d-file window, "
+    LOG.info("Download pipeline: %d Commons connections, %d archive connections, %d storage workers, %d-file window, "
              "%d metadata/batch, %d links prefetched (%s), %.1f Mbps media cap, "
              "%.3fs media request gap; local staging: %s",
-             workers, upload_workers, window, batch_size, metadata_prefetch,
+             workers, archive_workers, upload_workers, window, batch_size, metadata_prefetch,
              "full" if full_metadata else "basic",
              network.bandwidth.bytes_per_second * 8 / 1_000_000,
              network.rate_snapshot("image")["interval"], staging.root)
@@ -1004,6 +1240,7 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
 
     with ThreadPoolExecutor(max_workers=1) as metadata_pool, \
             ThreadPoolExecutor(max_workers=workers) as image_pool, \
+            ThreadPoolExecutor(max_workers=max(1, archive_workers)) as archive_pool, \
             ThreadPoolExecutor(max_workers=upload_workers) as upload_pool:
         while True:
             try:
@@ -1013,6 +1250,7 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                         result = future.result()
                     except CancelledError:
                         if kind != "metadata":
+                            network.finish_image(job.pop("_ticket", None), unused=True)
                             staging.release(job["file_id"])
                         continue
                     except (httpx.HTTPError, RetryableError, ValueError, OSError,
@@ -1021,11 +1259,11 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                             raise  # A failed API batch remains pending.
                         staging.release(job["file_id"])
                         unavailable = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (404, 410)
-                        bad_image = kind == "fetch" and isinstance(
+                        bad_image = kind in {"fetch", "archive"} and isinstance(
                             exc, (ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning))
                         # Pillow reports corrupt/unsupported files as OSError,
                         # whereas actual storage errors carry an errno.
-                        bad_image = bad_image or (kind == "fetch" and isinstance(exc, OSError) and exc.errno is None)
+                        bad_image = bad_image or (kind in {"fetch", "archive"} and isinstance(exc, OSError) and exc.errno is None)
                         fail(job, exc, systemic=not (unavailable or bad_image))
                         continue
                     if kind == "metadata":
@@ -1051,7 +1289,13 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                         catalog.db.commit()
                         if fatal is None:
                             ready.extend(job)
-                    elif kind == "fetch":
+                    elif kind in {"fetch", "archive"}:
+                        job.pop("_ticket", None)
+                        if result is None:
+                            staging.release(job["file_id"])
+                            if fatal is None:
+                                ready.append(job)
+                            continue
                         staging.fetched(job["file_id"], result["nbytes"])
                         progress.fetch_seconds += result["fetch_seconds"]
                         progress.throttle_seconds += result.get("throttle_seconds", 0.0)
@@ -1078,24 +1322,60 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
 
                 if fatal is None:
                     fetching = sum(kind == "fetch" for kind, _ in futures.values())
+                    archiving = sum(kind == "archive" for kind, _ in futures.values())
                     storing = sum(kind == "store" for kind, _ in futures.values())
+                    waiting_for_media = False
                     for _ in range(len(ready)):
                         row = ready[0]
                         if row["info"].get("error"):
                             ready.popleft()
                             catalog.db.execute("UPDATE files SET status='pending',attempts=attempts+1 WHERE file_id=?", (row["file_id"],))
                             fail(row, ValueError(row["info"]["error"]), systemic=False)
-                        elif fetching < workers and fetching + storing < window and staging.reserve(row["file_id"]):
-                            ready.popleft()
-                            # A previously completed but missing/truncated file must
-                            # stop being "downloaded" before its key is overwritten.
-                            catalog.db.execute("UPDATE files SET status='pending',attempts=attempts+1 WHERE file_id=?", (row["file_id"],))
-                            catalog.db.commit()
-                            task = image_pool.submit(staging.fetch, network, row)
-                            futures[task] = ("fetch", row)
-                            fetching += 1
                         else:
-                            ready.rotate(-1)
+                            staged = row["file_id"] in staging.sizes
+                            mirror = (archive_workers > 0 and not staged and
+                                      not row.get("_archive_tried") and not network.archive_disabled.is_set()
+                                      and bool(network.archive_urls(row["info"])))
+                            slots = archiving < archive_workers if mirror else fetching < workers
+                            if not slots or fetching + archiving + storing >= window:
+                                ready.rotate(-1)
+                                continue
+                            if not staging.reserve(row["file_id"]):
+                                ready.rotate(-1)
+                                continue
+                            ticket = None
+                            if not mirror and not staged:
+                                try:
+                                    ticket = network.reserve_image(row["info"]["download_url"])
+                                except BaseException:
+                                    staging.reserved.discard(row["file_id"])
+                                    raise
+                                if ticket is None:
+                                    staging.reserved.discard(row["file_id"])
+                                    waiting_for_media = True
+                                    ready.rotate(-1)
+                                    continue
+                            ready.popleft()
+                            try:
+                                # Requeueing a mirror miss is still the same file attempt.
+                                if not row.get("_attempt_started"):
+                                    catalog.db.execute("UPDATE files SET status='pending',attempts=attempts+1 WHERE file_id=?", (row["file_id"],))
+                                    catalog.db.commit()
+                                    row["_attempt_started"] = True
+                                if mirror:
+                                    row["_archive_tried"] = True
+                                    task = archive_pool.submit(staging.fetch, network, row, source="archive")
+                                    futures[task] = ("archive", row)
+                                    archiving += 1
+                                else:
+                                    row["_ticket"] = ticket
+                                    task = image_pool.submit(staging.fetch, network, row, ticket=ticket)
+                                    futures[task] = ("fetch", row)
+                                    fetching += 1
+                            except BaseException:
+                                network.finish_image(ticket, unused=True)
+                                staging.release(row["file_id"])
+                                raise
                     metadata_active = any(kind == "metadata" for kind, _ in futures.values())
                     free = metadata_prefetch - len(ready)
                     if not exhausted and not metadata_active and free >= batch_size:
@@ -1124,12 +1404,12 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                             futures[metadata_pool.submit(metadata_batch, batch)] = ("metadata", batch)
                         # Fill download slots immediately after reading cached metadata.
                         continue
-                    if not futures and ready:
+                    if not futures and ready and not waiting_for_media:
                         raise ValueError("Local staging is full; retained uploads need --retry-failed "
                                          "or a larger --staging-mib. No staged images were discarded.")
-                if not futures and (fatal is not None or exhausted):
+                if not futures and (fatal is not None or (exhausted and not ready)):
                     break
-                fetching = sum(kind == "fetch" for kind, _ in futures.values())
+                fetching = sum(kind in {"fetch", "archive"} for kind, _ in futures.values())
                 storing = sum(kind == "store" for kind, _ in futures.values())
                 progress.report(staging, len(futures), fetching=fetching, storing=storing,
                                 ready=len(ready), media=network.rate_snapshot("image"))
@@ -1138,9 +1418,17 @@ def download(catalog, network, *, width=960, workers=2, limit=None,
                                          and staging.used + max_bytes <= staging.capacity and any(
                                              kind == "metadata" for kind, _ in futures.values()))
                     waited_at = time.monotonic()
-                    wait(futures, timeout=min(1, log_interval), return_when=FIRST_COMPLETED)
+                    delays = (network.image_delay(row["info"]["download_url"])
+                              for row in ready if not row["info"].get("error"))
+                    media_wait = min((delay for delay in delays if delay > 0), default=1.0)
+                    wait(futures, timeout=max(0.001, min(1, log_interval, media_wait)),
+                         return_when=FIRST_COMPLETED)
                     if waiting_for_links:
                         progress.metadata_idle_seconds += time.monotonic() - waited_at
+                elif ready:
+                    delay = min(network.image_delay(row["info"]["download_url"]) for row in ready)
+                    if network.cancel.wait(max(0.001, min(1, log_interval, delay))):
+                        raise CancelledError()
             except BaseException as exc:
                 if fatal is not None:
                     if isinstance(exc, KeyboardInterrupt):
@@ -1259,6 +1547,8 @@ def parser():
     cmd = commands.add_parser("download", parents=[common], help="Download pending thumbnails; resume by repeating")
     cmd.add_argument("--width", type=int, default=None, help="Thumbnail width, default 960; 0 requests originals")
     cmd.add_argument("--workers", type=positive, default=2, help="Wikimedia image connections: 1 or 2 (default 2)")
+    cmd.add_argument("--archive-workers", type=int, default=10,
+                     help="Verified Internet Archive original downloads: 0..10 (default 10; 0 disables)")
     cmd.add_argument("--upload-workers", type=positive, default=4, help="Concurrent writes to image storage (default 4)")
     cmd.add_argument("--metadata-batch-size", type=positive, default=50,
                      help="Files per Commons lookup, at most 50 (default 50)")
@@ -1297,6 +1587,8 @@ def main(argv=None):
                 raise ValueError("--width must be zero or positive")
             if args.workers > 2:
                 raise ValueError("--workers must be 1 or 2 (Wikimedia media concurrency)")
+            if not 0 <= args.archive_workers <= 10:
+                raise ValueError("--archive-workers must be between 0 and 10")
             if args.bandwidth_mbps > 25:
                 raise ValueError("--bandwidth-mbps must be at most 25")
             if args.staging_mib < args.max_image_mib:
@@ -1357,7 +1649,8 @@ def main(argv=None):
                                  max_failures=args.max_consecutive_failures, upload_workers=args.upload_workers,
                                  staging_bytes=args.staging_mib * 1024**2, skip_existing_check=args.skip_existing_check,
                                  log_interval=args.log_interval, metadata_batch_size=args.metadata_batch_size,
-                                 metadata_prefetch=args.metadata_prefetch, full_metadata=args.full_metadata)
+                                 metadata_prefetch=args.metadata_prefetch, full_metadata=args.full_metadata,
+                                 archive_workers=args.archive_workers)
                     elif args.command == "export":
                         export(catalog)
                     elif args.command == "verify":

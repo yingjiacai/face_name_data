@@ -451,6 +451,36 @@ class Tests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaisesRegex(ValueError, "Unexpected Commons image host"):
                 network.image(url, self.catalog.root, "rejected", 1024**2)
 
+    def test_media_redirects_reserve_each_hop_and_reject_other_hosts(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.host)
+            if request.url.host == "upload.wikimedia.org":
+                return httpx.Response(302, headers={"Location": "https://thumb.wikimedia.org/image.png"})
+            return httpx.Response(200, content=png_bytes(), headers={"X-Cache-Status": "hit-front"})
+
+        network = self.network(handler)
+        limiter = p18.RateLimiter(image_interval=0)
+        network.limiter = limiter
+        result = network.image("https://upload.wikimedia.org/original.png", self.catalog.root,
+                               "redirected", 1024**2)
+        self.assertEqual(calls, ["upload.wikimedia.org", "thumb.wikimedia.org"])
+        self.assertEqual(result["sha256"], hashlib.sha256(png_bytes()).hexdigest())
+        self.assertEqual(limiter._image_buckets["miss"]["tokens"], 7)
+        self.assertEqual(limiter._image_tickets, {})
+
+        calls.clear()
+
+        def external(request):
+            calls.append(request.url.host)
+            return httpx.Response(302, headers={"Location": "https://example.com/image.png"})
+
+        with self.assertRaisesRegex(ValueError, "Unexpected Commons image host"):
+            self.network(external).image("https://upload.wikimedia.org/original.png",
+                                         self.catalog.root, "rejected-redirect", 1024**2)
+        self.assertEqual(calls, ["upload.wikimedia.org"])
+
     def test_retry_old_thumbnail_host_failures_preserves_completed_files(self):
         self.add(entity("Q42", "First.jpg"))
         self.add(entity("Q90", "Second.jpg", human=False))

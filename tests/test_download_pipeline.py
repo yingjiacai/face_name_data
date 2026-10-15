@@ -287,6 +287,32 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(media_calls), 3, "The retained image must not be fetched twice")
         self.assertEqual(p18.verify(self.catalog)["verified"], 3)
 
+    def test_full_spool_with_real_limiter_reports_capacity_without_media_wait(self):
+        self.add(3)
+        budget = len(png_bytes()) + 1
+        with mock.patch.object(p18, "store_image", side_effect=OSError(errno.EIO, "storage offline")):
+            self.assertEqual(p18.download(self.catalog, self.network(), limit=1,
+                                          max_bytes=budget, staging_bytes=budget), (1, 1))
+        self.reopen()
+
+        def metadata_only(request):
+            self.assertEqual(request.url.host, "commons.wikimedia.org",
+                             "A full spool must not start another image request")
+            return commons(request)
+
+        network = self.network(metadata_only)
+        network.limiter = p18.RateLimiter(api_interval=0, image_interval=0.1,
+                                          cancel=network.cancel, clock=lambda: 10.0)
+        # Freeze credit and fail any media wait so a regression fails promptly,
+        # instead of hanging after a failed reservation advances the request gap.
+        with mock.patch.object(network.cancel, "wait", side_effect=AssertionError(
+                "Full staging must report capacity, not wait for media credit")):
+            with self.assertRaisesRegex(ValueError, "staging is full"):
+                p18.download(self.catalog, network, max_bytes=budget,
+                             staging_bytes=budget, archive_workers=0)
+        self.assertEqual(self.catalog.summary()["file_status"], {"failed": 1, "pending": 2})
+        self.assertEqual(len(list((self.catalog.root / "staging").glob("*.json"))), 1)
+
     def test_interrupt_keeps_staged_image_uncommitted_and_resumable(self):
         self.add(1)
         with mock.patch.object(p18, "store_image", side_effect=KeyboardInterrupt()):

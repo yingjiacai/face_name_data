@@ -14,7 +14,7 @@ bash scripts/download_all_p18.sh
 
 该命令会连续完成：下载官方完整 JSON dump → 校验 → 提取具有真实 label 的 Q5 人物及其全部有效 P18 → 下载对应图片 → 导出名字—图像对。**没有 200/1000 条上限，也没有中途的试跑步骤。** 默认输出到 `data/p18-humans`，中断后重复相同命令即可恢复。非人物实体不会进入清单，也不会发起 Commons 图片请求。
 
-默认选用带日期的 `20261005` gzip 快照，解压速度通常比 bz2 快。可用 `P18_DUMP_DATE` 选择官方目录中其他已完成快照，用 `P18_DUMP_COMPRESSION=bz2` 选择体积更小的压缩包，用 `P18_IMAGE_WIDTH` 调整图片宽度。长任务可以直接放进 `tmux`：
+默认选用带日期的 `20261005` gzip 快照，解压速度通常比 bz2 快。可用 `P18_DUMP_DATE` 选择官方目录中其他已完成快照，用 `P18_DUMP_COMPRESSION=bz2` 选择体积更小的压缩包，用 `P18_IMAGE_WIDTH` 调整图片宽度。`P18_ARCHIVE_WORKERS` 控制 Internet Archive 补源连接数，默认 10，范围 0–10；设为 0 可关闭补源。已有输出目录继续使用原宽度。长任务可以直接放进 `tmux`：
 
 ```bash
 tmux new -s wikidata-p18 'bash scripts/download_all_p18.sh'
@@ -37,7 +37,9 @@ python scripts/download_p18.py status --output data/p18-humans
 5. SQLite 保存实体、对应关系、下载状态和 dump 进度；图片先在本机 `staging/` 写 `.part`、实际解码并计算 SHA-256，再交给独立线程写入最终图片目录。只有最终写入、同步和关闭成功，SQLite 才标记为 `downloaded`，随后清除暂存。对象存储上传失败或中断时保留本地副本供下次补传。
 6. 下载阶段不做人脸检测或身份验证。所有导出记录的 `reference_verified` 都是 `false`；不得直接把下载完成当成已经确认的 GT。
 
-Python 3.10+，Linux/macOS。CPU 机器即可。元数据 API 串行预取，默认每批最多 **50 个文件、提前缓存 200 个链接**；默认 2 条图片连接与 4 个存储写入线程。只查必要字段，链接队列独立于图片暂存预算；HTTP 连接空闲保留 60 秒，减少 API 等待后重新建连。图片完成后立即补入下一张，也不等待整批图片完成。两条图片连接共享按滚动 10 秒窗口计算的 25 Mbps 字节预算；实际窗口未达到上限时不会再为每个小文件额外休眠。图片请求起初没有固定间隔；收到 429 后，两条连接共同遵守 `Retry-After`，并从 0.20 秒开始自适应增加共享请求间隔，避免冷却结束后立即再次触发限流。5xx 和 `maxlag` 也会退避。[Wikimedia 媒体下载规则](https://wikitech.wikimedia.org/wiki/Robot_policy#Media_API_rules)要求最多 2 条媒体连接及 25 Mbps 总带宽，增加存储写入线程不会增加 Wikimedia 图片连接数。
+Python 3.10+，Linux/macOS。CPU 机器即可。元数据 API 串行预取，默认每批最多 **50 个文件、提前缓存 200 个链接**；默认 2 条 Wikimedia 图片连接与 4 个存储写入线程。只查必要字段，链接队列独立于图片暂存预算；HTTP 连接空闲保留 60 秒，减少 API 等待后重新建连。图片完成后立即补入下一张，也不等待整批图片完成。所有图片读取（包括 Internet Archive）共享按滚动 10 秒窗口计算的 25 Mbps 字节预算。Wikimedia 原图按缓存命中、未命中的两类预算调度，缩略图按共享最小请求间隔错峰；收到 429 后，两条 Wikimedia 连接共同遵守 `Retry-After`。5xx 和 `maxlag` 也会退避。[Wikimedia 媒体下载规则](https://wikitech.wikimedia.org/wiki/Robot_policy#Media_API_rules)要求最多 2 条媒体连接及 25 Mbps 总带宽，增加存储写入线程不会增加 Wikimedia 图片连接数。
+
+默认额外使用最多 10 条 Internet Archive 连接，为适用的旧原图提供补源。仅在任务本来就需要原图时尝试归档，取回内容必须与 Commons 元数据中的原始 SHA-1 和字节数一致，之后沿用相同的解码、暂存和写入流程。归档缺失、请求失败或校验不符时回到 Commons 下载；500px 缩略图仍按原来的宽度获取。补源不会改变清单、图片质量或已完成状态，实际提速取决于旧原图覆盖率和网络情况。
 
 ## 安装
 
@@ -226,19 +228,21 @@ rm -rf -- data/p18-all
 
 ## 对象存储与连续下载
 
-支持使用 `data/p18-humans/images` 指向对象存储挂载目录的软链接。SQLite、dump 和 `data/p18-humans/staging` 留在本机；`staging` 不能另行软链接到对象存储。更新脚本后，等旧下载进程退出，在原输出目录启动即可接着下载，无需重新导入 dump。
+支持使用 `data/p18-humans/images` 指向对象存储挂载目录的软链接。SQLite、dump 和 `data/p18-humans/staging` 留在本机；`staging` 不能另行软链接到对象存储。更新脚本后，等旧下载进程退出，在原输出目录按原宽度启动即可接着下载，保留现有图片软链接、SQLite 和暂存。启用补源无需 `derive`、重建数据库或重新导入 dump；已有派生人物库直接运行 `download`，不使用面向 dump 导入的全量脚本。
 
 对于已经完成图片迁移、验证过已有图片，并将对象存储挂载在 `/mnt/algo_data` 的 Google Cloud Linux 机器：
 
 ```bash
 (
 set -e
+cd /home/yingjia/face_name_data
 mountpoint -q /mnt/algo_data
 
-python scripts/download_p18.py download \
+.venv/bin/python scripts/download_p18.py download \
   --output data/p18-humans \
   --width 500 \
   --workers 2 \
+  --archive-workers 10 \
   --upload-workers 8 \
   --staging-mib 1024 \
   --skip-existing-check \
@@ -246,16 +250,17 @@ python scripts/download_p18.py download \
 )
 ```
 
-该命令在仓库目录运行，沿用已设置的 `P18_USER_AGENT`；也可显式传 `--user-agent`。默认处理整个清单，没有数量上限。
+该命令沿用已设置的 `P18_USER_AGENT`；也可显式传 `--user-agent`。默认处理整个清单，没有数量上限。需要关闭 Internet Archive 补源时，把 `--archive-workers 10` 改为 `--archive-workers 0`，其余参数和数据目录保持不变。
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `--workers` | `2` | Wikimedia 图片下载连接数，只能为 1 或 2。 |
+| `--archive-workers` | `10` | Internet Archive 补源连接数，范围 0–10；0 关闭。归档图片必须通过原始 SHA-1 和字节数校验，否则回退到 Commons。 |
 | `--upload-workers` | `4` | 最终图片目录的并发写入数；当前对象存储实测无积压，示例使用 8。只有 `storing` 持续增长时才需要提高。 |
 | `--metadata-batch-size` | `50` | 每次解析的文件数量，上限 50；过长的文件名列表自动改用 POST，避免 URL 长度限制。 |
 | `--metadata-prefetch` | `200` | 提前准备的图片链接数量；链接只占少量内存，不占图片暂存额度。 |
 | `--full-metadata` | 关闭 | 解析新链接时同时取作者、许可文本和长说明；开启后每批最多 5 张。不会为已完成图片重新下载或自动补齐其元数据。 |
-| `--bandwidth-mbps` | `25` | 两条图片连接共享的总带宽上限，单位为兆比特/秒，上限 25；按滚动 10 秒窗口统计并包含重试数据。 |
+| `--bandwidth-mbps` | `25` | 所有图片来源共享的总带宽上限，单位为兆比特/秒，上限 25；按滚动 10 秒窗口统计并包含重试数据。 |
 | `--staging-mib` | `1024` | 本地暂存图片的预算，必须至少容纳一张 `--max-image-mib` 规定的最大图片。 |
 | `--skip-existing-check` | 关闭 | 直接相信 SQLite 中的 `downloaded` 状态，跳过对象存储上的逐文件存在性/大小查询。缺失或损坏的旧文件需用 `verify --repair` 发现并重新排队。 |
 | `--log-interval` | `15` | 每隔多少秒输出一条速度、剩余量和耗时统计。 |
@@ -269,7 +274,7 @@ python scripts/download_p18.py download \
 
 每条进度包含 `files/s`（最近约一分钟的处理速度，含失败）、`MiB/s stored`（成功写入的字节速度）、本轮剩余任务数、`ETA`、`avg fetch`（下载和本地校验平均耗时）、`bandwidth wait`（每张图因滚动带宽窗口主动等待的平均秒数）、`media gap`（两次图片请求开始之间的固定最小错峰时间）、`429 响应数/共享冷却次数`、共享冷却累计秒数、`store`（最终存储平均耗时）、`metadata`（每批链接查询的平均耗时和文件数）、`link wait`（有下载空位与暂存空间时等待链接的累计秒数）、`fetching`、`storing`（上传中和排队中的任务数）、`ready`（已准备好的链接数）、复用暂存数及暂存额度。`ready` 长期为 0 且 `link wait` 增长说明链接供应不足；待上传任务持续增加则说明最终存储跟不上。ETA 估计的是本轮结束时间，失败文件仍需重试；不能把离线测试速度当成云端实测速度。
 
-`Retry image 1/5 ... HTTP 429; shared cooldown, image request gap 0.100s` 表示图片 CDN 要求暂缓，本轮还没有产生失败。两条图片线程会共同遵守 `Retry-After`，冷却结束后用 0.1 秒最小间隔错开请求开始时间，避免同时冲出。偶发 429 不再永久增大该间隔；日志中的 `429 responses ... across ... cooldowns` 可区分同一冷却窗口内的两个在途响应和独立限流事件。`Retry api` 来自 Commons/Wikidata 元数据接口，单独冷却。
+`Retry image ... HTTP 429; shared cooldown` 表示 Wikimedia 图片 CDN 要求暂缓，本轮还没有产生失败。两条 Wikimedia 图片线程会共同遵守 `Retry-After`，随后继续按原图、缩略图各自的请求预算调度。日志中的 `429 responses ... across ... cooldowns` 可区分同一冷却窗口内的两个在途响应和独立限流事件。`Retry api` 来自 Commons/Wikidata 元数据接口，单独冷却。
 
 `source.metadata_profile=basic` 表示这次只查询必要字段，作者和许可文本没有在本次请求中获取。原有详细缓存会继续复用；失败项重新解析为轻量信息时，早先的详细信息及其获取时间保存在 `source.previous_extmetadata`。需要这些字段时可沿来源页另行获取。
 

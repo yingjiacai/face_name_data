@@ -16,6 +16,7 @@ item limit. Repeat the same command to resume. Default output: data/p18-humans.
 Environment:
   P18_USER_AGENT       Existing downloader User-Agent (required)
   P18_IMAGE_WIDTH      Thumbnail width, default 500
+  P18_ARCHIVE_WORKERS  Internet Archive connections, 0 to 10, default 10 (0 disables)
   P18_DUMP_DATE        Official dump date, default 20261005
   P18_DUMP_COMPRESSION gz (faster decompression, default) or bz2 (smaller download)
   P18_PYTHON           Python executable, default .venv/bin/python or python3
@@ -28,12 +29,17 @@ output_dir="${1:-data/p18-humans}"
 dump_date="${P18_DUMP_DATE:-20261005}"
 compression="${P18_DUMP_COMPRESSION:-gz}"
 image_width="${P18_IMAGE_WIDTH:-500}"
+archive_workers="${P18_ARCHIVE_WORKERS:-10}"
 python_bin="${P18_PYTHON:-$repo_dir/.venv/bin/python}"
 if [[ ! -x "$python_bin" && -z ${P18_PYTHON:-} ]]; then
     python_bin=python3
 fi
 if [[ ! $dump_date =~ ^[0-9]{8}$ || ! $compression =~ ^(gz|bz2)$ || ! $image_width =~ ^[0-9]+$ ]]; then
     printf '%s\n' 'Invalid dump date, compression, or image width.' >&2
+    exit 1
+fi
+if [[ ! $archive_workers =~ ^([0-9]|10)$ ]]; then
+    printf '%s\n' 'P18_ARCHIVE_WORKERS must be an integer from 0 to 10.' >&2
     exit 1
 fi
 command -v curl >/dev/null
@@ -132,7 +138,8 @@ printf '[2/4] Importing named human entities with P18\n'
 printf '[3/4] Downloading human catalog images at width %s\n' "$image_width"
 download_status=0
 "$python_bin" scripts/download_p18.py download \
-    --output "$output_dir" --width "$image_width" --retry-failed || download_status=$?
+    --output "$output_dir" --width "$image_width" \
+    --archive-workers "$archive_workers" --retry-failed || download_status=$?
 
 printf '[4/4] Exporting complete catalog and current download results\n'
 "$python_bin" scripts/download_p18.py export --output "$output_dir"
